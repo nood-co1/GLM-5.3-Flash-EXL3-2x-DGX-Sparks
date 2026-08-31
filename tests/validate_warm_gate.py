@@ -5,7 +5,9 @@
     send W + a short follow-up (uncached remainder well under WARM_TOKENS) -> TTFT_warm <= 3 s (v1 `skip`: 15-17 s),
     and its `cached_tokens` (if the server reports prompt_tokens_details) must be >= 90 % of its prompt.
  B. control just above the warm window: W + ~6K new tokens (> WARM_TOKENS) during G -> must NOT bypass: TTFT >= MAX_WAIT_MS.
- C. while G decodes, a cold 20K read C -> TTFT >= MAX_WAIT_MS and <= MAX_WAIT_MS + 3 s (deadline, then late cap);
+ C. while G decodes, a cold 20K read C: time-to-first-SERVICE (the moment vllm:num_requests_running rises to 2, polled at
+    5 Hz) must be within [0.9 x MAX_WAIT_MS, MAX_WAIT_MS + 2.5 s] — the deadline bounds admission, NOT TTFT: the first
+    content token only arrives after the whole prefill (20K at LATE_CAP tokens/step), which is reported for information.
     G's stream rate before / during / after is reported in SSE chunks per second (DFlash2 emits several tokens per chunk,
     so this is NOT tokens/s; only ratios are meaningful).
 Env: GLM53_BASE_URL (default http://127.0.0.1:8888), VLLM_API_KEY (bearer), GLM53_MIXED_PREFILL_WARM_TOKENS/MAX_WAIT_MS
@@ -81,6 +83,23 @@ def rate(rec: dict, a: float, b: float) -> float:
     return round(len([t for t in rec.get("chunks", []) if a <= t <= b]) / max(b - a, 1e-6), 1)
 
 
+def running_now() -> float:
+    t = urllib.request.urlopen(urllib.request.Request(BASE + "/metrics", headers=_headers()), timeout=10).read().decode()
+    return sum(float(v) for v in re.findall(r"^vllm:num_requests_running(?:\{[^}]*\})? (\S+)", t, re.M))
+
+
+def time_to_service(baseline: float, t0: float, stop: dict, limit: float = 120.0):
+    """Poll num_requests_running until it exceeds the baseline; return seconds since t0 (or None)."""
+    while time.time() - t0 < limit and not stop.get("done"):
+        try:
+            if running_now() > baseline:
+                return time.time() - t0
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return None
+
+
 def cached(rec: dict):
     u = rec.get("usage") or {}
     return (u.get("prompt_tokens_details") or {}).get("cached_tokens"), u.get("prompt_tokens")
@@ -122,16 +141,21 @@ def main() -> int:
     print(f"[{tag}] B control (> WARM_TOKENS new tokens) during G: TTFT {b['ttft']:.2f}s", flush=True)
     check(b["ttft"] >= MAX_WAIT_S * 0.9, f"B: above-window follow-up NOT bypassed (TTFT {b['ttft']:.2f}s >= {MAX_WAIT_S:.1f}s)")
     time.sleep(2)
-    # C. cold arrival
-    c = {}; tc = time.time(); stream(C, 4, c)
-    print(f"[{tag}] C cold 20K arrival during G: TTFT {c['ttft']:.2f}s wall {c['wall']:.1f}s", flush=True)
-    check(MAX_WAIT_S * 0.9 <= c["ttft"] <= MAX_WAIT_S + 3.0 or c["ttft"] <= 3.0,
-          f"C: cold arrival starts after the deadline (TTFT {c['ttft']:.2f}s in [{MAX_WAIT_S*0.9:.1f}, {MAX_WAIT_S+3:.1f}] s)")
+    # C. cold arrival: admission time via the running-count transition, TTFT for information
+    base = running_now()
+    c = {}; stop = {}; tts_box = {}
+    def _poll():
+        tts_box["v"] = time_to_service(base, tc, stop)
+    tc = time.time(); pth = threading.Thread(target=_poll, daemon=True); pth.start(); stream(C, 4, c); stop["done"] = True; pth.join(timeout=5)
+    tts = tts_box.get("v")
+    print(f"[{tag}] C cold 20K arrival during G: time-to-first-service {tts if tts is None else round(tts, 2)}s (running {base:g} -> {base+1:g}) | TTFT {c['ttft']:.2f}s wall {c['wall']:.1f}s", flush=True)
+    check(tts is not None and MAX_WAIT_S * 0.9 <= tts <= MAX_WAIT_S + 2.5,
+          f"C: cold arrival admitted after the deadline (time-to-first-service {tts} s in [{MAX_WAIT_S*0.9:.1f}, {MAX_WAIT_S+2.5:.1f}] s)")
     during = rate(g, tc, tc + c["wall"]); after = rate(g, tc + c["wall"], tc + c["wall"] + 5)
     th.join(timeout=900)
     print(f"[{tag}] G chunks/s: before {before} | during cold prefill {during} | after {after} | solo {solo_rate}", flush=True)
     summary = {"tag": tag, "run": RUN, "warm_ttft": round(w["ttft"], 2), "warm_cached": c_tok, "control_ttft": round(b["ttft"], 2),
-               "cold_ttft": round(c["ttft"], 2), "cold_wall": round(c["wall"], 1), "g_before": before, "g_during": during,
+               "cold_time_to_service": None if tts is None else round(tts, 2), "cold_ttft": round(c["ttft"], 2), "cold_wall": round(c["wall"], 1), "g_before": before, "g_during": during,
                "g_after": after, "solo": solo_rate, "fails": fails}
     print("SUMMARY " + json.dumps(summary), flush=True)
     return 1 if fails else 0
