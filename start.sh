@@ -74,6 +74,7 @@ _cli_ablit_layers="${ABLIT_LAYERS-}"
 _cli_ablit_alpha="${ABLIT_ALPHA-}"
 _cli_ablit_mtp="${ABLIT_INCLUDE_MTP-}"
 _cli_finegrained="${GLM53_FINEGRAINED_APC-}"
+_cli_extra_env_set="${GLM53_EXTRA_ENV+1}"
 _cli_extra_env="${GLM53_EXTRA_ENV-}"
 _cli_apc_set="${GLM53_APC_RETENTION_INTERVAL+1}"
 _cli_apc="${GLM53_APC_RETENTION_INTERVAL-}"
@@ -87,7 +88,7 @@ source "$SCRIPT_DIR/.env"
 set +a
 [ -n "${_cli_mtp}" ] && MTP_TOKENS="$_cli_mtp"
 [ -n "${_cli_finegrained}" ] && GLM53_FINEGRAINED_APC="$_cli_finegrained"
-[ -n "${_cli_extra_env}" ] && GLM53_EXTRA_ENV="$_cli_extra_env"
+[ -n "${_cli_extra_env_set}" ] && GLM53_EXTRA_ENV="$_cli_extra_env"
 [ -n "${_cli_apc_set}" ] && GLM53_APC_RETENTION_INTERVAL="$_cli_apc"
 [ -n "${_cli_chunk}" ] && GLM53_MIXED_PREFILL_CHUNK="$_cli_chunk"
 [ -n "${_cli_warm}" ] && GLM53_MIXED_PREFILL_WARM_TOKENS="$_cli_warm"
@@ -1175,17 +1176,25 @@ launch_cluster() {
         log "drafter (SWA) prefix-cache retention interval: ${GLM53_APC_RETENTION_INTERVAL_SWA} (both ranks)"
     fi
     # Extra container env for diagnostics (space-separated NAME=VALUE list, e.g. GLM53_EXTRA_ENV="VLLM_DEBUG_WORKSPACE=1").
-    # Applied to both ranks. Names must be [A-Z_][A-Z0-9_]*; anything else aborts the launch.
+    # Applied to both ranks. Names: [A-Z_][A-Z0-9_]*, not launcher-owned (NCCL_*, HF_*, GLM53_*, VLLM_API_KEY, cache dirs,
+    # allocator/arch settings). Values: [A-Za-z0-9_./:@,+=-]* only (no spaces, quotes, globs or shell metacharacters — the
+    # worker command line is built as shell text). Only names are logged.
     if [ -n "${GLM53_EXTRA_ENV:-}" ]; then
-        local _kv
+        local _kv _name _value _names=""
+        set -f
         for _kv in $GLM53_EXTRA_ENV; do
-            case "$_kv" in
-                [A-Z_]*=*) [[ "${_kv%%=*}" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "GLM53_EXTRA_ENV: bad name in '$_kv'";;
-                *) die "GLM53_EXTRA_ENV entries must be NAME=VALUE (got '$_kv')";;
+            case "$_kv" in *=*) ;; *) set +f; die "GLM53_EXTRA_ENV entries must be NAME=VALUE (got '$_kv')";; esac
+            _name="${_kv%%=*}"; _value="${_kv#*=}"
+            [[ "$_name" =~ ^[A-Z_][A-Z0-9_]*$ ]] || { set +f; die "GLM53_EXTRA_ENV: bad name in '$_kv'"; }
+            [[ "$_value" =~ ^[A-Za-z0-9_./:@,+=-]*$ ]] || { set +f; die "GLM53_EXTRA_ENV: unsafe value for $_name (allowed: A-Z a-z 0-9 _ . / : @ , + = -)"; }
+            case "$_name" in
+                NCCL_*|HF_*|GLM53_*|VLLM_API_KEY|VLLM_CACHE_ROOT|TRITON_CACHE_DIR|TILELANG_CACHE_DIR|TORCH_CUDA_ARCH_LIST|FLASHINFER_*|PYTORCH_CUDA_ALLOC_CONF|LD_PRELOAD|PATH|PYTHONPATH|VLLM_ENGINE_READY_TIMEOUT_S|VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS|VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS|VLLM_PREFIX_CACHE_RETENTION_INTERVAL*)
+                    set +f; die "GLM53_EXTRA_ENV: $_name is launcher-owned; set it through its own knob";;
             esac
-            nccl_common+=(-e "$_kv")
+            nccl_common+=(-e "$_kv"); _names="$_names $_name"
         done
-        log "extra container env (both ranks): $GLM53_EXTRA_ENV"
+        set +f
+        log "extra container env (both ranks):${_names}"
     fi
     local worker_nccl="" e
     for e in "${nccl_common[@]}"; do
