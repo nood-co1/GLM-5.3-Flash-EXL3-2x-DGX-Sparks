@@ -249,7 +249,7 @@ GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # skip = do not mix; N>0 = cap tokens; 0 = off.
 GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-skip}"
 # 1 = fine-grained (64-token) prefix-cache hits (overlay patch_apc_fine_grained_hits.py); 0 = upstream 3584-block hits.
-GLM53_FINEGRAINED_APC="${GLM53_FINEGRAINED_APC:-1}"
+GLM53_FINEGRAINED_APC="${GLM53_FINEGRAINED_APC-1}"
 # Space-separated NAME=VALUE list of extra env for both container ranks (diagnostics, e.g. VLLM_DEBUG_WORKSPACE=1).
 GLM53_EXTRA_ENV="${GLM53_EXTRA_ENV:-}"
 # Sparse prefix-cache snapshot retention (tokens; positive multiple of 3584, <= 1,000,000).
@@ -307,6 +307,13 @@ warn() { printf '\033[1;33m[glm53-exl3]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[glm53-exl3]\033[0m ERROR: %s\n' "$*" >&2; exit 1; }
 
 # GLM53 numeric config guard (begin)
+_glm53_validate_bool_flag() {
+    local name="$1" value="$2"
+    if [ "$value" != 0 ] && [ "$value" != 1 ]; then
+        echo "$name must be exactly 0 or 1 (got: $value)" >&2
+        return 2
+    fi
+}
 # --- glm53 apc-retention knob (tested by tests/test_apc_retention_knob.sh) ---
 # 3584 = this kit's hybrid scheduler block (attention block raised to the mamba page; see README).
 glm53_apc_retention_env() {
@@ -359,6 +366,7 @@ validate_numeric_config() {
     _glm53_canonical_positive_int MAX_MODEL_LEN "$MAX_MODEL_LEN" 1000000 || return
     _glm53_canonical_positive_int MAX_NUM_SEQS "$MAX_NUM_SEQS" 4096 || return
     _glm53_canonical_positive_int MAX_NUM_BATCHED_TOKENS "$MAX_NUM_BATCHED_TOKENS" 8388608 || return
+    _glm53_validate_bool_flag GLM53_FINEGRAINED_APC "${GLM53_FINEGRAINED_APC-1}" || return
     glm53_apc_retention_env "${GLM53_APC_RETENTION_INTERVAL-}" || return
     # mixed-prefill gate v2 knobs (self-defaulting so the guard block runs standalone; 0 = feature off for the first two)
     GLM53_MIXED_PREFILL_WARM_TOKENS="${GLM53_MIXED_PREFILL_WARM_TOKENS:-3584}"

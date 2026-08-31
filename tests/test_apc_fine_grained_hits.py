@@ -7,23 +7,42 @@ Part A (patch mechanics, mirrors tests/test_hybrid_prefix_hit.py):
   apply to a COPY of kv_cache_coordinator.py, assert the MARK and anchors
   landed, assert idempotence, assert fail-closed on a drifted anchor, assert
   fail-closed on a pre-existing-but-incomplete marker, assert the apply is
-  transactional (no partial writes, no temp litter), and assert composability
-  with overlay/patch_hybrid_prefix_hit.py in both orders and under re-apply.
+  transactional (no partial writes, no temp litter), assert composability
+  with overlay/patch_hybrid_prefix_hit.py in both orders and under re-apply,
+  and assert the "upstream already fixed it" path (A6): a coordinator whose
+  veto is already scoped to prefix_cacheable groups (vLLM main e126687a) is a
+  clean no-op exit 0, while a merely drifted or deleted veto still fails closed.
 
 Part B (gate semantics):
   exec the injected helper block in a bare namespace, then drive it with fakes
   that mirror the live KV cache layout and several hostile variants.  This is
   the part that actually encodes the correctness argument.
 
-  Note the two-tier fail-closed policy under test:
+  Note the fail-closed policy under test, as a 2x2 (DESIGN 4.3) -- rows are
+  "does a PARTICIPATING manager already block fine lookups", columns are "is a
+  NON-PARTICIPATING scratch group unsafe or unverifiable":
+
+      blocker vs scratch |   ok    |  bad
+      ------------------+---------+---------
+      no                | ENABLE  | RAISE
+      yes               | DISABLE | DISABLE
+
     * a PARTICIPATING manager that cannot do fine lookups -> DISABLE
       (block-aligned hits are the correct, safe fallback; this is upstream's
-      own condition);
-    * a NON-PARTICIPATING scratch group whose alignment requirement is
-      violated or unverifiable -> RAISE Glm53FineGrainedAPCError at coordinator
-      init, tagged "[glm53-apc-finegrained]".  Silently degrading there would
-      hide that this patch's safety argument does not hold on that layout.
+      own condition) -- and that stays DISABLE even when a scratch group is
+      also bad, because no fine-grained hit is taken on that layout, so the
+      scratch invariant is unreachable and a boot failure would be gratuitous;
+    * a NON-PARTICIPATING scratch group whose alignment requirement is violated
+      or unverifiable, on a layout that would otherwise ENABLE -> RAISE
+      Glm53FineGrainedAPCError at coordinator init, tagged
+      "[glm53-apc-finegrained]".  Silently degrading there would hide that this
+      patch's safety argument does not hold on that layout.
       GLM53_FINEGRAINED_APC=0 is the documented escape hatch.
+
+Part C (launcher knob):
+  drives start.sh's "GLM53 numeric config guard" block in bash and asserts
+  GLM53_FINEGRAINED_APC is accepted only as exactly 0 or 1, the same rule the
+  coordinator enforces at init.
 
 Source of truth for the live layout (docker logs glm53-exl3-head):
   kv_cache_coordinator.py:709  hybrid APC groups:
@@ -96,6 +115,31 @@ MARK = "# [glm53-finegrained-apc]"
 RUNTIME_TAG = "[glm53-apc-finegrained]"
 HELPER_BEGIN = "# [glm53-finegrained-apc] helper-begin"
 HELPER_END = "# [glm53-finegrained-apc] helper-end"
+
+# The unscoped upstream veto this overlay replaces (kv_cache_coordinator.py
+# :626-639) and the shape vLLM main e126687a gave it once upstream scoped the
+# check to prefix-cacheable groups. Used by A6 to synthesize an
+# already-fixed-upstream coordinator.
+UPSTREAM_VETO = """        if self.enable_partial_hash_hits:
+            unsupported_partial_hit_managers = {
+                type(manager).__name__
+                for manager in self.single_type_managers
+                if not manager.supports_fine_grained_hash_lookup
+                and manager.block_size != hash_block_size
+            }
+"""
+
+UPSTREAM_FIXED_VETO = """        if self.enable_partial_hash_hits:
+            unsupported_partial_hit_managers = {
+                type(manager).__name__
+                for manager, group in zip(
+                    self.single_type_managers, kv_cache_config.kv_cache_groups
+                )
+                if group.kv_cache_spec.prefix_cacheable
+                and not manager.supports_fine_grained_hash_lookup
+                and manager.block_size != hash_block_size
+            }
+"""
 
 FAILURES: list[str] = []
 
@@ -281,6 +325,70 @@ def part_a(src: Path) -> str:
                 dst.read_text() == broken,
                 f"A5 pre-existing MARK + {label} -> file untouched",
             )
+
+        # A6 upstream landed the same fix (vLLM main e126687a scopes the veto
+        # to KVCacheSpec.prefix_cacheable groups; its scratch invariant is the
+        # tokens_per_state check in resolve_kv_cache_block_sizes). A recipe
+        # image rebased onto that vLLM must be a clean no-op, not a boot
+        # failure from a missing anchor.
+        shutil.copyfile(src, dst)
+        upstream_fixed = dst.read_text().replace(
+            UPSTREAM_VETO, UPSTREAM_FIXED_VETO, 1
+        )
+        check(
+            upstream_fixed != dst.read_text(),
+            "A6 fixture: the upstream veto anchor was found and replaced",
+        )
+        dst.write_text(upstream_fixed)
+        out = apply_patch(PATCH, dst)
+        check(
+            "upstream already scopes the veto; nothing to do" in out,
+            "A6 upstream-fixed coordinator -> no-op, announced",
+        )
+        check(RUNTIME_TAG in out, f"A6 the no-op message carries {RUNTIME_TAG}")
+        check(
+            dst.read_text() == upstream_fixed,
+            "A6 upstream-fixed coordinator left byte-identical",
+        )
+        check(no_temp_litter(Path(tmp)), "A6 no temp file left behind")
+        out = apply_patch(PATCH, dst)
+        check(
+            "nothing to do" in out and dst.read_text() == upstream_fixed,
+            "A6 re-running on an upstream-fixed coordinator is still a no-op",
+        )
+
+        # A6b the veto is GONE entirely -- that is drift, not an upstream fix.
+        shutil.copyfile(src, dst)
+        gutted = dst.read_text().replace(UPSTREAM_VETO, "", 1)
+        dst.write_text(gutted)
+        err = apply_patch(PATCH, dst, expect_fail=True)
+        check(
+            "expected one partial-hit-gate target" in err,
+            "A6b a deleted veto still fails closed (not read as 'upstream fixed')",
+        )
+        check(dst.read_text() == gutted, "A6b transactional: file untouched")
+
+        # A6c an unscoped veto that merely drifted must still fail closed, even
+        # though `participates_in_prefix_caching` appears ~25 lines below it in
+        # verify_and_split_kv_cache_groups. A text window would read that
+        # neighbour as proof of a fix; the indentation-scoped extractor does not.
+        shutil.copyfile(src, dst)
+        drifted2 = dst.read_text().replace(
+            "                if not manager.supports_fine_grained_hash_lookup\n",
+            "                if not manager.supports_fine_grained_hash_lookup  # x\n",
+            1,
+        )
+        check(drifted2 != dst.read_text(), "A6c fixture: veto line drifted")
+        dst.write_text(drifted2)
+        err = apply_patch(PATCH, dst, expect_fail=True)
+        check(
+            "expected one partial-hit-gate target" in err,
+            "A6c drifted-but-unscoped veto still fails closed",
+        )
+        check(
+            "participates_in_prefix_caching" in drifted2,
+            "A6c the neighbour attribute really is present in the file",
+        )
 
     # A4 composability with patch_hybrid_prefix_hit.py, both orders.
     # Run over every available source: the caller's src (which on this kit is
@@ -538,12 +646,12 @@ CASES = [
         "index_kpool=6 disagrees",
     ),
     (
-        "B13 explicit fine_grained_hit_alignment capability honoured (divides) -> ENABLE",
+        "B13 explicit fine_grained_hit_alignment agreeing with block_size -> ENABLE",
         [
             ("FullAttentionManager", 3584, True, True, None),
             (
                 "FutureScratchManager",
-                999,
+                16,
                 False,
                 False,
                 {"fine_grained_hit_alignment": 16},
@@ -555,12 +663,66 @@ CASES = [
         None,
     ),
     (
+        "B13b explicit capability is the ONLY source (no block_size anywhere) "
+        "-> ENABLE (the forward-compat hook still works)",
+        [
+            ("FullAttentionManager", 3584, True, True, None),
+            (
+                "FutureScratchManager",
+                None,
+                False,
+                False,
+                {"fine_grained_hit_alignment": 16},
+            ),
+            ("MambaManager", 3584, True, True, None),
+        ],
+        64,
+        "enable",
+        None,
+    ),
+    (
+        "B13c capability 16 CONTRADICTS block_size 128 -> REFUSE. 16 divides 64, "
+        "so trusting the capability would have ENABLED unsafe hits on a group "
+        "that needs 128",
+        [
+            ("FullAttentionManager", 3584, True, True, None),
+            (
+                "FutureScratchManager",
+                128,
+                False,
+                False,
+                {"fine_grained_hit_alignment": 16},
+            ),
+            ("MambaManager", 3584, True, True, None),
+        ],
+        64,
+        "raise",
+        "disagrees with",
+    ),
+    (
+        "B13d capability contradicts index_kpool -> REFUSE",
+        [
+            ("FullAttentionManager", 3584, True, True, None),
+            (
+                "KpoolTailManager",
+                4,
+                False,
+                False,
+                {"fine_grained_hit_alignment": 4, "index_kpool": 8},
+            ),
+            ("MambaManager", 3584, True, True, None),
+        ],
+        64,
+        "raise",
+        "index_kpool=8 disagrees",
+    ),
+    (
         "B14 explicit fine_grained_hit_alignment that does NOT divide -> REFUSE",
         [
             ("FullAttentionManager", 3584, True, True, None),
             (
                 "FutureScratchManager",
-                4,
+                96,
                 False,
                 False,
                 {"fine_grained_hit_alignment": 96},
@@ -570,6 +732,61 @@ CASES = [
         64,
         "raise",
         "requires hit alignment 96",
+    ),
+    (
+        "B23 capability '4.5' -> REFUSE (int() would have truncated it to 4, "
+        "which divides 64)",
+        [
+            ("FullAttentionManager", 3584, True, True, None),
+            (
+                "FutureScratchManager",
+                None,
+                False,
+                False,
+                {"fine_grained_hit_alignment": "4.5"},
+            ),
+            ("MambaManager", 3584, True, True, None),
+        ],
+        64,
+        "raise",
+        "is not an integer",
+    ),
+    (
+        "B23b scratch spec.block_size ' 4' (padded string) -> REFUSE",
+        [
+            ("FullAttentionManager", 3584, True, True, None),
+            ("KpoolTailManager", 4, False, False, {"block_size": " 4"}),
+            ("MambaManager", 3584, True, True, None),
+        ],
+        64,
+        "raise",
+        "is not an integer",
+    ),
+    (
+        "B24 MIXED: participating blocker AND a violating scratch group "
+        "-> DISABLE safely (upstream behaviour), do NOT raise",
+        [
+            ("FullAttentionManager", 3584, True, True, None),
+            ("KpoolTailManager", 128, False, False, {"index_kpool": 128}),
+            ("MambaManager", 3584, True, True, None),
+            ("SlidingWindowManager", 3584, False, True, None),  # SWA raised
+        ],
+        64,
+        "disable",
+        "participating",
+    ),
+    (
+        "B25 MIXED: participating blocker AND an UNVERIFIABLE scratch group "
+        "-> DISABLE safely, do NOT raise",
+        [
+            ("FullAttentionManager", 3584, True, True, None),
+            ("KpoolTailManager", 4, False, False, {"block_size": None}),
+            ("MambaManager", 3584, True, True, None),
+            ("SlidingWindowManager", 3584, False, True, None),  # SWA raised
+        ],
+        64,
+        "disable",
+        "participating",
     ),
     (
         "B15 manager missing supports_fine_grained_hash_lookup -> treated as False",
@@ -736,14 +953,26 @@ def part_b(patched_text: str) -> None:
     exec(runner, run_ns)  # noqa: S102
     run = run_ns["_glm53_run"]
 
-    class FakeLogger:
-        def info(self, *a, **k):
-            pass
+    class RecordingLogger:
+        """Renders every call the way logging would, so the receipt is testable."""
 
-        def warning_once(self, *a, **k):
-            pass
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def _record(self, msg, *args) -> None:
+            self.lines.append(msg % args if args else msg)
+
+        def info(self, msg, *args, **kwargs):
+            self._record(msg, *args)
+
+        def warning(self, msg, *args, **kwargs):
+            self._record(msg, *args)
+
+        def warning_once(self, msg, *args, **kwargs):
+            self._record(msg, *args)
 
     def drive(layout, kill_switch):
+        """Run the shipped gate block; return (enable_partial_hash_hits, log)."""
         managers, groups = build(layout)
         obj = types.SimpleNamespace(
             enable_partial_hash_hits=True,
@@ -756,21 +985,26 @@ def part_b(patched_text: str) -> None:
         if kill_switch is not None:
             env["GLM53_FINEGRAINED_APC"] = kill_switch
         fake_os = types.SimpleNamespace(environ=env)
-        run(obj, cfg, 64, fake_os, FakeLogger())
-        return obj.enable_partial_hash_hits
+        log = RecordingLogger()
+        run(obj, cfg, 64, fake_os, log)
+        return obj.enable_partial_hash_hits, log.lines
 
     BAD = [
         ("FullAttentionManager", 3584, True, True, None),
         ("KpoolTailManager", 128, False, False, {"index_kpool": 128}),
         ("MambaManager", 3584, True, True, None),
     ]
-    check(drive(LIVE_LAYOUT, None) is True, "B22 gate block enables on the live layout")
+    # BAD plus a participating blocker: the mixed cell, through the real block.
+    BAD_MIXED = BAD + [("SlidingWindowManager", 3584, False, True, None)]
+
+    enabled, log = drive(LIVE_LAYOUT, None)
+    check(enabled is True, "B22 gate block enables on the live layout")
     check(
-        drive(LIVE_LAYOUT, "0") is False,
+        drive(LIVE_LAYOUT, "0")[0] is False,
         "B22 GLM53_FINEGRAINED_APC=0 disables fine hits",
     )
     check(
-        drive(LIVE_LAYOUT, "1") is True,
+        drive(LIVE_LAYOUT, "1")[0] is True,
         "B22 GLM53_FINEGRAINED_APC=1 is the default (enabled)",
     )
     try:
@@ -780,10 +1014,146 @@ def part_b(patched_text: str) -> None:
         ok = True
     check(ok, "B22 a violating layout REFUSES through the real gate block")
     try:
-        ok = drive(BAD, "0") is False
+        ok = drive(BAD, "0")[0] is False
     except err_cls:
         ok = False
     check(ok, "B22 GLM53_FINEGRAINED_APC=0 escapes the refusal (documented opt-out)")
+
+    # ---------------------------------------------------------------- B26
+    # Strict integer parsing. int() would accept every value in the reject
+    # list, and truncating "4.5" to 4 (which divides 64) is exactly how an
+    # unverified alignment gets a verified badge.
+    strict_int = ns["_glm53_strict_int"]
+    for value, expected in (
+        (4, 4),
+        (0, 0),
+        (-4, -4),
+        ("4", 4),
+        ("+4", 4),
+        ("0004", 4),
+        ("-4", -4),
+    ):
+        check(strict_int(value) == expected, f"B26 strict int accepts {value!r}")
+    for value in (
+        4.5,
+        4.0,
+        "4.5",
+        " 4",
+        "4 ",
+        "",
+        "0x40",
+        "4_0",
+        "4\n",
+        "\u0664",     # ARABIC-INDIC DIGIT FOUR: str.isdigit() is True
+        "\u00b2",     # SUPERSCRIPT TWO: str.isdigit() is True
+        True,
+        False,
+        None,
+        object(),
+    ):
+        check(strict_int(value) is None, f"B26 strict int REJECTS {value!r}")
+    check(
+        int("4.5".replace(".5", "")) == 4 and strict_int("4.5") is None,
+        "B26 the value int() would have silently truncated is refused instead",
+    )
+
+    # ---------------------------------------------------------------- B27
+    # The kill switch is exactly '0' or '1'; anything else refuses at init.
+    enabled_fn = ns["_glm53_finegrained_enabled"]
+    check(enabled_fn("1") is True, "B27 kill switch '1' -> on")
+    check(enabled_fn("0") is False, "B27 kill switch '0' -> off")
+    for bad in ("", " ", "0 ", " 0", "01", "00", "2", "-0", "true", "false",
+                "yes", "no", "on", "off", "True", "1.0"):
+        try:
+            enabled_fn(bad)
+            ok, detail = False, "accepted"
+        except err_cls as exc:
+            ok = RUNTIME_TAG in str(exc) and "GLM53_FINEGRAINED_APC" in str(exc)
+            detail = "refused"
+        check(ok, f"B27 kill switch {bad!r} REFUSES at init -> {detail}")
+    for bad in ("true", "", "01"):
+        try:
+            drive(LIVE_LAYOUT, bad)
+            ok = False
+        except err_cls:
+            ok = True
+        check(ok, f"B27 GLM53_FINEGRAINED_APC={bad!r} refuses through the gate block")
+
+    # ---------------------------------------------------------------- B28
+    # The 2x2 mixed-layout matrix (DESIGN 4.3), all four cells, driven through
+    # the shipped gate block rather than the helper alone.
+    SAFE_SCRATCH = ("KpoolTailManager", 4, False, False, {"index_kpool": 4})
+    BAD_SCRATCH = ("KpoolTailManager", 128, False, False, {"index_kpool": 128})
+    COARSE_BLOCKER = ("SlidingWindowManager", 3584, False, True, None)
+    BASE = [("FullAttentionManager", 3584, True, True, None),
+            ("MambaManager", 3584, True, True, None)]
+    matrix = [
+        ("no blocker  + scratch ok  -> ENABLE", BASE + [SAFE_SCRATCH], "enable"),
+        ("no blocker  + scratch bad -> RAISE", BASE + [BAD_SCRATCH], "raise"),
+        ("blocker     + scratch ok  -> DISABLE",
+         BASE + [SAFE_SCRATCH, COARSE_BLOCKER], "disable"),
+        ("blocker     + scratch bad -> DISABLE (safe, not a boot failure)",
+         BASE + [BAD_SCRATCH, COARSE_BLOCKER], "disable"),
+    ]
+    for label, layout, expected in matrix:
+        try:
+            enabled, lines = drive(layout, None)
+            got = "enable" if enabled else "disable"
+        except err_cls:
+            got = "raise"
+            lines = []
+        check(got == expected, f"B28 matrix {label} -> {got}")
+    # and the cell the reviewer flagged keeps the diagnosis in the receipt
+    _enabled, lines = drive(BAD_MIXED, None)
+    check(
+        any("UNSAFE" in line and "128" in line for line in lines),
+        "B28 the tolerated scratch fault is still named in the receipt",
+    )
+
+    # ---------------------------------------------------------------- B29
+    # Effective-value receipt: one line stating enabled/disabled, the reason,
+    # the alignment actually in force, and the scratch groups checked. This is
+    # the line DESIGN 6.5 B0 greps out of `docker logs` on BOTH ranks.
+    _enabled, lines = drive(LIVE_LAYOUT, None)
+    receipt = next((l for l in lines if RUNTIME_TAG in l), "")
+    for token in (
+        "Fine-grained prefix-cache hits ENABLED",
+        "reason=",
+        "effective alignment=64 tokens",
+        "scheduler_block_size=3584",
+        "scratch groups checked: {'KpoolTailManager': 4}",
+        "KV-transfer connector:",
+    ):
+        check(token in receipt, f"B29 enabled receipt states {token!r}")
+
+    _enabled, lines = drive(LIVE_LAYOUT, "0")
+    receipt = next((l for l in lines if RUNTIME_TAG in l), "")
+    for token in (
+        "Fine-grained prefix-cache hits DISABLED",
+        "reason=GLM53_FINEGRAINED_APC=0 (kill switch)",
+        "effective alignment=3584 tokens",
+        "hash_block_size=64",
+        "scratch groups checked:",
+    ):
+        check(token in receipt, f"B29 kill-switch receipt states {token!r}")
+
+    _enabled, lines = drive(BAD_MIXED, None)
+    receipt = next((l for l in lines if RUNTIME_TAG in l), "")
+    for token in (
+        "Fine-grained prefix-cache hits DISABLED",
+        "reason=participating managers require block-aligned lookups",
+        "effective alignment=3584 tokens",
+        "scratch groups checked:",
+    ):
+        check(token in receipt, f"B29 mixed-layout receipt states {token!r}")
+    check(
+        any(
+            "Disabling fine-grained prefix-cache hits because these KV cache "
+            "managers require block-aligned lookups" in line
+            for line in lines
+        ),
+        "B29 upstream's own warning is still emitted on the disable path",
+    )
 
     # B9: the arithmetic claim the whole design rests on.
     check(64 % 4 == 0, "B9 hash_block_size 64 is a multiple of index_kpool 4")
@@ -814,6 +1184,97 @@ def part_b(patched_text: str) -> None:
     check(31616 % 4 == 0, "B21 the fine hit lands on an empty kpool (31616 % 4 == 0)")
 
 
+# --------------------------------------------------------------------------
+# Part C -- the launcher knob
+# --------------------------------------------------------------------------
+
+START_SH = HERE.parent / "start.sh"
+
+
+def guard_source() -> str:
+    """start.sh's numeric-config guard block, lifted out by its sentinels.
+
+    Same technique as tests/test_numeric_config.py: the block is sourced on its
+    own so the assertion is about the shipped shell, not a paraphrase of it.
+    """
+    source = START_SH.read_text()
+    begin = source.index("# GLM53 numeric config guard (begin)")
+    end_marker = "# GLM53 numeric config guard (end)"
+    end = source.index(end_marker, begin) + len(end_marker)
+    return source[begin:end]
+
+
+def run_guard(flag: str | None) -> int:
+    script = (
+        guard_source()
+        + '\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4\n'
+        + 'MAX_NUM_BATCHED_TOKENS=1024\n'
+        + 'validate_numeric_config || exit $?\n'
+        + 'printf "ok %s\\n" "${GLM53_FINEGRAINED_APC-unset}"\n'
+    )
+    env = {**os.environ, "LC_ALL": "C"}
+    env.pop("GLM53_FINEGRAINED_APC", None)
+    if flag is not None:
+        env["GLM53_FINEGRAINED_APC"] = flag
+    return subprocess.run(
+        ["bash", "-c", script],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    ).returncode
+
+
+def part_c() -> None:
+    print("Part C: launcher knob (start.sh)")
+    if not START_SH.is_file():
+        print("  skip C (start.sh not found)")
+        return
+
+    source = START_SH.read_text()
+
+    # C1 the knob is validated by the same guard as the numeric config, which
+    # main() runs only on start|restart -- and, for restart, before `stop`.
+    check(
+        "_glm53_validate_bool_flag GLM53_FINEGRAINED_APC" in guard_source(),
+        "C1 GLM53_FINEGRAINED_APC is validated inside the numeric config guard",
+    )
+    main_at = source.index("main() {")
+    check(
+        source.index("start|restart) validate_numeric_config", main_at)
+        < source.index("restart)  stop; start", main_at),
+        "C1 validation still runs on start|restart, before stop",
+    )
+
+    # C2 exactly 0 or 1, matching _glm53_finegrained_enabled in the overlay.
+    for value in (None, "0", "1"):
+        check(run_guard(value) == 0, f"C2 GLM53_FINEGRAINED_APC={value!r} accepted")
+    for value in ("", " ", "0 ", " 0", "01", "00", "2", "-1", "true", "false",
+                  "yes", "no", "on", "off", "True", "1.0", "0\r"):
+        check(
+            run_guard(value) == 2,
+            f"C2 GLM53_FINEGRAINED_APC={value!r} rejected with rc=2",
+        )
+
+    # C3 the validated value is what both rank containers actually receive.
+    check(
+        '-e "GLM53_FINEGRAINED_APC=$GLM53_FINEGRAINED_APC"' in source,
+        "C3 the knob is exported to the containers by value",
+    )
+    nccl = source.index("local -a nccl_common=(")
+    check(
+        nccl < source.index('-e "GLM53_FINEGRAINED_APC=', nccl)
+        < source.index(")\n", nccl),
+        "C3 it rides nccl_common, so head AND worker get the same value",
+    )
+    caller = source.index('_cli_finegrained="${GLM53_FINEGRAINED_APC-}"')
+    check(
+        caller < source.index('source "$SCRIPT_DIR/.env"')
+        < source.index('[ -n "${_cli_finegrained}" ]'),
+        "C3 a caller-supplied value is captured before .env and restored after",
+    )
+
+
 def main() -> int:
     if PATCH is None:
         raise SystemExit("missing patch_apc_fine_grained_hits.py")
@@ -831,6 +1292,7 @@ def main() -> int:
         print(f"hybrid overlay: {HYBRID_PATCH}")
     patched_text = part_a(src)
     part_b(patched_text)
+    part_c()
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}): " + "; ".join(FAILURES))

@@ -63,6 +63,25 @@ Fail-closed, in both directions
   message that names the group, the alignment, and the remedy.
   ``GLM53_FINEGRAINED_APC=0`` is the documented escape hatch: it restores the
   upstream (all-managers) veto verbatim and never raises.
+* **Mixed layout** -- a *participating* blocker AND a bad scratch group at once:
+  DISABLE, do not raise.  The participating blocker already forces upstream's
+  own safe fallback: alignment stays at ``scheduler_block_size``, no
+  fine-grained hit is ever taken, so the scratch invariant is unreachable.
+  Refusing to boot there would turn an upstream-equivalent configuration into
+  an outage.  The refusal is reserved for the one case where it is
+  load-bearing: fine-grained hits would otherwise be **ENABLED** with an unsafe
+  or unverifiable scratch group.  Full 2x2 in docs §4.3.
+* Alignment sources are cross-checked, never trusted one at a time.  An
+  explicit ``fine_grained_hit_alignment`` capability is checked against
+  ``manager.block_size`` / ``spec.block_size`` / ``spec.index_kpool`` /
+  ``spec.kpool``; ANY contradiction is UNVERIFIABLE (refuse), never "the
+  capability wins".
+* Values are parsed with a strict integer check, never ``int()``: ``int()``
+  truncates ``4.5`` to ``4`` and accepts ``" 4"``, either of which would let a
+  wrong alignment through wearing a verified badge.
+* The kill switch is exactly ``0`` or ``1``.  Any other value (``true``,
+  ``01``, ``""``, ``" 0"``) refuses at init rather than being guessed --
+  guessing it wrong silently changes the KV-cache hit alignment.
 * Manager/group cardinality is asserted before iterating -- upstream's ``zip()``
   would silently truncate the scan if the two lists ever diverged.
 
@@ -75,13 +94,29 @@ Patcher fail-closed / transactional
 * If ``MARK`` is already present the patcher does not just skip: it validates
   the complete patched state (helper block, gate, kill switch, tag, no
   surviving upstream veto) and fails closed if anything is missing.
+* **Upstream fixed it** (vLLM main ``e126687a``: the veto is scoped to
+  ``KVCacheSpec.prefix_cacheable`` groups, and the scratch invariant lives in
+  ``resolve_kv_cache_block_sizes``'s ``tokens_per_state`` check).  A recipe
+  image rebased onto that vLLM must not fail to boot because our anchor is
+  gone: if the veto block is already scoped on ``prefix_cacheable`` /
+  ``participates_in_prefix_caching``, the patcher prints
+  ``upstream already scopes the veto; nothing to do`` and exits 0 without
+  touching the file.  Detection is structural -- the actual
+  ``if self.enable_partial_hash_hits:`` suite is extracted by indentation and
+  must contain both the ``supports_fine_grained_hash_lookup`` veto and a
+  scoping attribute -- so genuine partial or foreign drift (the anchor merely
+  edited, or the veto deleted outright) still fails closed.
 
 Idempotent, MARK/anchor guarded.  Order-independent with respect to
 ``patch_hybrid_prefix_hit.py`` (different anchors; shared helper insert point is
 guarded by name).
 
 Kill switch: ``GLM53_FINEGRAINED_APC=0`` in the engine environment restores the
-upstream (all-managers) veto at runtime without unpatching.
+upstream (all-managers) veto at runtime without unpatching; ``=1`` (or unset)
+is the fine-grained default.  Nothing else is accepted -- see above.
+``start.sh`` validates the same knob the same way in its
+``# GLM53 numeric config guard`` block, so a typo is a launcher error rather
+than a container that will not boot.
 """
 
 from __future__ import annotations
@@ -135,78 +170,134 @@ class Glm53FineGrainedAPCError(RuntimeError):
     """
 
 
+def _glm53_strict_int(value):
+    """Strict integer parse -- no coercion, no truncation, no trimming.
+
+    ``int()`` is the wrong tool for validating a capability: ``int(4.5)`` is
+    ``4`` and ``int(" 4")`` is ``4``, so a value that is not an integer at all
+    comes back wearing a verified badge and can enable an unsafe alignment.
+
+    Accepts only a real ``int`` (``bool`` is rejected -- ``True`` is not an
+    alignment) or an ASCII decimal string with an optional sign and no
+    surrounding whitespace.  Everything else -- ``4.5``, ``"4.5"``, ``" 4"``,
+    ``"4 "``, ``""``, ``"0x40"``, ``"4_0"``, non-ASCII digits, ``None``,
+    arbitrary objects -- returns ``None``, which every caller treats as
+    UNVERIFIABLE.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        digits = value[1:] if value[:1] in ("+", "-") else value
+        if digits and digits.isascii() and digits.isdigit():
+            return int(value)
+        return None
+    return None
+
+
+# Every attribute that can speak for a scratch group's required hit alignment,
+# in the order they are reported.  ``fine_grained_hit_alignment`` is the
+# forward-compatible capability; the rest are the observable facts it must not
+# contradict.
+GLM53_ALIGNMENT_ATTRS = (
+    "fine_grained_hit_alignment",
+    "block_size",
+    "index_kpool",
+    "kpool",
+)
+
+
 def _glm53_scratch_alignment(manager, spec):
     """Token alignment a non-participating (scratch) group requires.
 
     Read from the ACTUAL manager/spec objects -- never assumed, never
     defaulted.  Returns ``(alignment, source)``, or ``(None, reason)`` when the
-    group cannot be verified, in which case the caller must refuse to start.
+    group cannot be verified, in which case the caller must refuse.
 
-    Resolution order:
+    **Every** available source is collected and they must all agree:
+    ``fine_grained_hit_alignment`` and ``block_size`` on the manager and on the
+    spec, plus ``index_kpool`` / ``kpool``.  An explicit
+    ``fine_grained_hit_alignment`` capability is NOT authoritative on its own: a
+    capability of 16 on a spec whose ``block_size`` is 128 is a contradiction,
+    and a contradiction is UNVERIFIABLE (refuse), not "the capability wins".
+    Trusting it would enable 64-token hits on a group that needs 128 -- exactly
+    the unsafe mid-pool resume this gate exists to prevent.
 
-    1. An explicit capability, ``fine_grained_hit_alignment`` on the manager or
-       the spec.  This is the forward-compatible hook: a scratch manager that
-       knows its own requirement states it, and nothing has to be inferred.
-    2. Otherwise ``spec.block_size``, cross-checked against
-       ``manager.block_size`` (they must agree) and, when the spec exposes it,
-       against ``spec.index_kpool`` / ``spec.kpool``.  For GLM5Next's
-       ``KpoolTailSpec`` this is exactly ``index_kpool``, which is the quantity
-       the invariant is really about.
+    The capability's real job is to let a future scratch manager that exposes no
+    ``block_size`` at all state its requirement; when it is the only source
+    present it stands alone.  With no capability offered, ``spec.block_size`` is
+    required and must be cross-checked against ``manager.block_size``.  For
+    GLM5Next's ``KpoolTailSpec`` every source is ``index_kpool``, which is the
+    quantity the invariant is really about.
 
-    Anything unverifiable -- a missing block_size, a non-integer, or two
-    sources that disagree -- returns ``None`` and is treated as a hard failure.
+    Anything unverifiable -- a missing block_size, a non-integer (strictly
+    parsed: ``4.5`` and ``" 4"`` are NOT integers), or two sources that disagree
+    -- returns ``None`` and is treated as a hard failure.
     """
+    candidates = []
     for owner, owner_name in ((manager, "manager"), (spec, "spec")):
-        declared = getattr(owner, "fine_grained_hit_alignment", None)
-        if declared is not None:
-            try:
-                declared_int = int(declared)
-            except (TypeError, ValueError):
+        for attr in GLM53_ALIGNMENT_ATTRS:
+            raw = getattr(owner, attr, None)
+            if raw is None:
+                continue
+            parsed = _glm53_strict_int(raw)
+            if parsed is None:
                 return None, (
-                    f"{owner_name}.fine_grained_hit_alignment={declared!r} "
-                    "is not an integer"
+                    f"{owner_name}.{attr}={raw!r} is not an integer "
+                    f"({type(raw).__name__}); an alignment that cannot be "
+                    "parsed exactly cannot be verified"
                 )
-            return declared_int, f"{owner_name}.fine_grained_hit_alignment"
+            candidates.append((f"{owner_name}.{attr}", parsed))
 
-    spec_bs = getattr(spec, "block_size", None)
-    mgr_bs = getattr(manager, "block_size", None)
-    if spec_bs is None:
-        return None, (
-            f"{type(spec).__name__} exposes neither block_size nor "
-            "fine_grained_hit_alignment"
-        )
-    try:
-        spec_bs = int(spec_bs)
-    except (TypeError, ValueError):
-        return None, f"{type(spec).__name__}.block_size={spec_bs!r} is not an integer"
-    if mgr_bs is None:
-        return None, f"{type(manager).__name__} exposes no block_size to cross-check"
-    try:
-        mgr_bs = int(mgr_bs)
-    except (TypeError, ValueError):
-        return None, f"{type(manager).__name__}.block_size={mgr_bs!r} is not an integer"
-    if spec_bs != mgr_bs:
-        return None, (
-            f"spec.block_size={spec_bs} disagrees with "
-            f"manager.block_size={mgr_bs}"
-        )
-
-    source = "spec.block_size"
-    for attr in ("index_kpool", "kpool"):
-        declared = getattr(spec, attr, None)
-        if declared is None:
-            continue
-        try:
-            declared_int = int(declared)
-        except (TypeError, ValueError):
-            return None, f"{type(spec).__name__}.{attr}={declared!r} is not an integer"
-        if declared_int != spec_bs:
+    labels = {label for label, _ in candidates}
+    if not any(label.endswith("fine_grained_hit_alignment") for label in labels):
+        if "spec.block_size" not in labels:
             return None, (
-                f"{type(spec).__name__}.{attr}={declared_int} disagrees with "
-                f"block_size={spec_bs}"
+                f"{type(spec).__name__} exposes neither block_size nor "
+                "fine_grained_hit_alignment"
             )
-        source = f"spec.block_size == spec.{attr}"
-    return spec_bs, source
+        if "manager.block_size" not in labels:
+            return None, (
+                f"{type(manager).__name__} exposes no block_size to cross-check"
+            )
+
+    first_label, first_value = candidates[0]
+    for label, value in candidates[1:]:
+        if value != first_value:
+            return None, (
+                f"{label}={value} disagrees with {first_label}={first_value} "
+                f"({type(spec).__name__} / {type(manager).__name__}); "
+                "contradictory alignment sources are unverifiable, and an "
+                "explicit fine_grained_hit_alignment capability is never taken "
+                "as authoritative over them"
+            )
+
+    return first_value, " == ".join(label for label, _ in candidates)
+
+
+def _glm53_finegrained_enabled(value):
+    """Parse the ``GLM53_FINEGRAINED_APC`` kill switch. Exactly ``0`` or ``1``.
+
+    Not ``bool(value)``, not ``value != "0"``: anything but the two accepted
+    strings refuses at init.  A typo'd knob (``true``, ``01``, ``" 0"``, ``""``)
+    must never be silently read as "on" -- it decides the KV-cache hit alignment
+    the whole engine then runs at, and the wrong answer is invisible everywhere
+    except the receipt line.
+    """
+    if value == "1":
+        return True
+    if value == "0":
+        return False
+    raise Glm53FineGrainedAPCError(
+        f"{GLM53_FG_TAG} GLM53_FINEGRAINED_APC={value!r} is not a valid "
+        "kill-switch value. It must be exactly '1' (fine-grained prefix-cache "
+        "hits ON; also the default when the variable is unset) or '0' (OFF, "
+        "upstream all-managers veto restored). Values such as 'true', 'yes', "
+        "'01', ' 0' or '' are REFUSED rather than guessed, because guessing "
+        "wrong silently changes the KV-cache hit alignment. Refusing to start. "
+        "Set GLM53_FINEGRAINED_APC=0 to restore the upstream gate."
+    )
 
 
 def _glm53_connector_receipt():
@@ -240,8 +331,12 @@ def _glm53_connector_receipt():
 def _glm53_finegrained_hit_gate(managers, kv_cache_groups, hash_block_size):
     """Decide whether fine-grained (hash-block-aligned) hits are state-safe.
 
-    Returns ``(enable, blockers, scratch)``; raises
-    ``Glm53FineGrainedAPCError`` when an invariant cannot be verified or is
+    Returns ``(enable, blockers, scratch)``.  ``scratch`` maps each
+    non-participating group's manager name to its verified alignment (an int),
+    or to a diagnostic string when that group is unsafe/unverifiable but a
+    participating blocker already forced the safe fallback.  Raises
+    ``Glm53FineGrainedAPCError`` only when fine-grained hits would otherwise be
+    ENABLED on a layout whose scratch invariant cannot be verified or is
     violated.
 
     Two distinct populations, two distinct questions:
@@ -264,9 +359,31 @@ def _glm53_finegrained_hit_gate(managers, kv_cache_groups, hash_block_size):
       ``H % kpool`` raw K/gate entries unrecomputed, which
       ``index_kpool_always_select_tail`` would then compress.  Require
       ``hash_block_size % alignment == 0`` so every reachable hit boundary
-      lands on an empty pool -- and RAISE if it does not hold, or cannot be
-      checked.  Degrading silently here would hide the fact that this patch's
-      safety argument does not apply to the running layout.
+      lands on an empty pool.
+
+    Mixed layouts -- the 2x2 (docs/DESIGN-apc-fine-grained-hits.md 4.3)::
+
+        participating blocker | scratch unsafe/unverifiable | outcome
+        ----------------------+-----------------------------+---------
+        no                    | no                          | ENABLE
+        no                    | YES                         | RAISE
+        YES                   | no                          | DISABLE
+        YES                   | YES                         | DISABLE
+
+    The last cell is why scratch faults are collected rather than raised on
+    sight.  A participating blocker already pins the alignment to
+    ``scheduler_block_size``, so no fine-grained hit is ever taken and the
+    scratch invariant is not reachable; that layout behaves exactly as upstream
+    does, and refusing to boot on it would turn an upstream-equivalent
+    configuration into an outage.  The refusal is load-bearing only in the
+    second cell, where the alternative is serving fine-grained hits whose safety
+    argument does not hold.  Faults still travel in ``scratch`` so the receipt
+    line names them either way.
+
+    Structural failures -- cardinality mismatch, a group with no
+    ``kv_cache_spec``, a nonsense ``hash_block_size`` -- raise immediately and
+    are not subject to the matrix: they mean the layout could not be classified
+    at all, so "a participating blocker makes it moot" cannot be established.
 
     Cardinality is asserted before iterating: upstream pairs these two lists
     with ``zip()``, which would silently truncate the scan -- and therefore
@@ -289,7 +406,9 @@ def _glm53_finegrained_hit_gate(managers, kv_cache_groups, hash_block_size):
             "enable fine-grained prefix-cache hits. Set "
             "GLM53_FINEGRAINED_APC=0 to restore the upstream gate."
         )
-    if not isinstance(hash_block_size, int) or hash_block_size <= 0:
+    if _glm53_strict_int(hash_block_size) is None or not isinstance(
+        hash_block_size, int
+    ) or hash_block_size <= 0:
         raise Glm53FineGrainedAPCError(
             f"{GLM53_FG_TAG} hash_block_size={hash_block_size!r} is not a "
             "positive integer; the fine-grained hit alignment is undefined. "
@@ -297,8 +416,9 @@ def _glm53_finegrained_hit_gate(managers, kv_cache_groups, hash_block_size):
             "upstream gate."
         )
 
-    blockers: list[str] = []
-    scratch: dict[str, int] = {}
+    blockers = []
+    scratch = {}
+    faults = []
     for index, (manager, group) in enumerate(zip(managers, groups)):
         name = type(manager).__name__
         spec = getattr(group, "kv_cache_spec", None)
@@ -324,29 +444,52 @@ def _glm53_finegrained_hit_gate(managers, kv_cache_groups, hash_block_size):
 
         alignment, source = _glm53_scratch_alignment(manager, spec)
         if alignment is None:
-            raise Glm53FineGrainedAPCError(
-                f"{GLM53_FG_TAG} cannot verify the hit-alignment requirement "
-                f"of non-participating scratch group {index} {name} "
+            scratch[name] = f"UNVERIFIABLE ({source})"
+            faults.append(
+                "cannot verify the hit-alignment requirement of "
+                f"non-participating scratch group {index} {name} "
                 f"({type(spec).__name__}): {source}. A fine-grained hit could "
-                "resume mid-pool and leave un-recomputed raw K/gate entries. "
-                "Refusing to start. Set GLM53_FINEGRAINED_APC=0 to fall back "
-                "to block-aligned (scheduler_block_size) hits."
+                "resume mid-pool and leave un-recomputed raw K/gate entries."
             )
-        scratch[name] = alignment
+            continue
         if alignment <= 0 or hash_block_size % alignment != 0:
-            raise Glm53FineGrainedAPCError(
-                f"{GLM53_FG_TAG} scratch group {index} {name} "
-                f"({type(spec).__name__}) requires hit alignment "
-                f"{alignment} (verified from {source}), but "
-                f"hash_block_size={hash_block_size} is not a multiple of it. "
-                "Every reachable fine-grained hit boundary H would satisfy "
+            scratch[name] = (
+                f"UNSAFE (requires hit alignment {alignment}, verified from "
+                f"{source}; hash_block_size={hash_block_size} is not a "
+                "multiple of it)"
+            )
+            faults.append(
+                f"scratch group {index} {name} ({type(spec).__name__}) "
+                f"requires hit alignment {alignment} (verified from {source}), "
+                f"but hash_block_size={hash_block_size} is not a multiple of "
+                "it. Every reachable fine-grained hit boundary H would satisfy "
                 f"H % {alignment} != 0 for some H, resuming mid-pool and "
                 "leaving un-recomputed raw K/gate entries that "
-                "index_kpool_always_select_tail would then compress. "
-                "Refusing to start. Set GLM53_FINEGRAINED_APC=0 to fall back "
-                "to block-aligned (scheduler_block_size) hits."
+                "index_kpool_always_select_tail would then compress."
             )
-    return (not blockers), blockers, scratch
+            continue
+        scratch[name] = alignment
+
+    if blockers:
+        # Mixed layout, matrix rows 3 and 4: a PARTICIPATING manager cannot
+        # answer a fine lookup, so fine-grained hits are off and the alignment
+        # stays at scheduler_block_size -- upstream's own behaviour. No
+        # fine-grained hit is taken, so an unsafe scratch group (if any) is
+        # unreachable, and a safe fallback must not be escalated into a boot
+        # failure. The fault text still travels in `scratch` for the receipt.
+        return False, blockers, scratch
+    if faults:
+        # Matrix row 2: nothing else stops fine-grained hits here, so this
+        # refusal is the only thing between this layout and an unsafe mid-pool
+        # resume.
+        raise Glm53FineGrainedAPCError(
+            f"{GLM53_FG_TAG} " + " ".join(faults) + " Fine-grained "
+            "prefix-cache hits would otherwise be ENABLED on this layout and "
+            "no participating manager forces the safe fallback. Refusing to "
+            "start. Set GLM53_FINEGRAINED_APC=0 to fall back to block-aligned "
+            "(scheduler_block_size) hits."
+        )
+    return True, blockers, scratch
 
 
 # [glm53-finegrained-apc] helper-end
@@ -384,13 +527,13 @@ GATE_NEW = """        if self.enable_partial_hash_hits:
             # invariant a scratch group actually needs instead: the hit must
             # land where its per-request state is empty
             # (hash_block_size % alignment == 0), verified at runtime from the
-            # actual specs. A scratch group that fails or cannot be verified
-            # RAISES -- see _glm53_finegrained_hit_gate.
-            if os.environ.get("GLM53_FINEGRAINED_APC", "1") == "0":
-                _glm53_ok = False
-                _glm53_blockers = ["GLM53_FINEGRAINED_APC=0 (kill switch)"]
-                _glm53_scratch: dict = {}
-            else:
+            # actual specs. A participating blocker DISABLES (upstream's own
+            # safe fallback, even if a scratch group is also bad); only a
+            # layout that would otherwise ENABLE with an unsafe scratch group
+            # RAISES -- see _glm53_finegrained_hit_gate and DESIGN 4.3.
+            if _glm53_finegrained_enabled(
+                os.environ.get("GLM53_FINEGRAINED_APC", "1")
+            ):
                 _glm53_ok, _glm53_blockers, _glm53_scratch = (
                     _glm53_finegrained_hit_gate(
                         self.single_type_managers,
@@ -398,21 +541,57 @@ GATE_NEW = """        if self.enable_partial_hash_hits:
                         hash_block_size,
                     )
                 )
+                _glm53_why = (
+                    "every participating manager can answer a "
+                    "hash_block_size-granular lookup, and every "
+                    "non-participating scratch alignment divides it"
+                    if _glm53_ok
+                    else "participating managers require block-aligned "
+                    "lookups: " + ", ".join(sorted(_glm53_blockers))
+                )
+            else:
+                _glm53_ok = False
+                _glm53_blockers = ["GLM53_FINEGRAINED_APC=0 (kill switch)"]
+                _glm53_scratch = {}
+                _glm53_why = (
+                    "GLM53_FINEGRAINED_APC=0 (kill switch): upstream "
+                    "all-managers veto restored"
+                )
             self.enable_partial_hash_hits = _glm53_ok
+            # Effective-value receipt. One line, both ranks, states what is
+            # actually in force -- enabled/disabled, why, the alignment hits
+            # will really land on, and every scratch group that was checked
+            # (value = verified alignment, or the fault that was tolerated
+            # because a participating blocker already disabled fine hits).
+            # DESIGN 6.5 B0 greps this from `docker logs` on head AND worker.
             if _glm53_ok:
                 logger.info(  # [glm53-finegrained-apc]
-                    "Fine-grained prefix-cache hits ENABLED: alignment=%d "
-                    "tokens (hash_block_size), was scheduler_block_size=%d. "
-                    "Verified non-participating scratch alignments %s all "
-                    "divide the alignment, so every reachable hit boundary "
-                    "leaves their per-request state empty. "
+                    "[glm53-apc-finegrained] "
+                    "Fine-grained prefix-cache hits ENABLED: reason=%s; "
+                    "effective alignment=%s tokens (hash_block_size; "
+                    "scheduler_block_size=%s); "
+                    "scratch groups checked: %s; "
                     "KV-transfer connector: %s.",
+                    _glm53_why,
                     hash_block_size,
                     self.scheduler_block_size,
                     _glm53_scratch or {},
                     _glm53_connector_receipt(),
                 )
             else:
+                logger.warning(  # [glm53-finegrained-apc]
+                    "[glm53-apc-finegrained] "
+                    "Fine-grained prefix-cache hits DISABLED: reason=%s; "
+                    "effective alignment=%s tokens (scheduler_block_size; "
+                    "hash_block_size=%s); "
+                    "scratch groups checked: %s; "
+                    "KV-transfer connector: %s.",
+                    _glm53_why,
+                    self.scheduler_block_size,
+                    hash_block_size,
+                    _glm53_scratch or {},
+                    _glm53_connector_receipt(),
+                )
                 logger.warning_once(
                     "Disabling fine-grained prefix-cache hits because these KV "
                     "cache managers require block-aligned lookups: %s.",
@@ -429,21 +608,85 @@ REQUIRED_AFTER = (
     HELPER_END,
     RUNTIME_TAG,
     "class Glm53FineGrainedAPCError(RuntimeError):",
+    "def _glm53_strict_int(",
     "def _glm53_scratch_alignment(",
+    "def _glm53_finegrained_enabled(",
     "def _glm53_connector_receipt(",
     "def _glm53_finegrained_hit_gate(",
     "GLM53_FINEGRAINED_APC",
     "Fine-grained prefix-cache hits ENABLED",
+    "Fine-grained prefix-cache hits DISABLED",
+    "scratch groups checked",
     "manager/group cardinality mismatch",
 )
 
 UNIQUE_AFTER = (
     HELPER_BEGIN,
     HELPER_END,
+    "def _glm53_strict_int(",
     "def _glm53_scratch_alignment(",
+    "def _glm53_finegrained_enabled(",
     "def _glm53_connector_receipt(",
     "def _glm53_finegrained_hit_gate(",
 )
+
+
+# Attributes upstream uses to scope the veto to prefix-caching groups.
+# ``prefix_cacheable`` is vLLM main (e126687a); ``participates_in_prefix_caching``
+# is this fork's spelling of the same idea.
+SCOPE_ATTRS = ("prefix_cacheable", "participates_in_prefix_caching")
+
+GATE_HEADER = "if self.enable_partial_hash_hits:"
+
+
+def partial_hit_gate_blocks(text: str) -> list[str]:
+    """Every ``if self.enable_partial_hash_hits:`` suite, by indentation.
+
+    Structural, not a text window: ``cache_blocks`` opens an identical ``if``
+    35 lines later and ``verify_and_split_kv_cache_groups`` mentions
+    ``participates_in_prefix_caching`` ~25 lines after the veto, so any
+    fixed-size window around the veto would read a neighbour's tokens as if
+    they were the veto's own.
+    """
+    lines = text.splitlines(keepends=True)
+    blocks: list[str] = []
+    for index, line in enumerate(lines):
+        if line.strip() != GATE_HEADER:
+            continue
+        indent = len(line) - len(line.lstrip())
+        block = [line]
+        for nxt in lines[index + 1 :]:
+            if nxt.strip() and (len(nxt) - len(nxt.lstrip())) <= indent:
+                break
+            block.append(nxt)
+        blocks.append("".join(block))
+    return blocks
+
+
+def upstream_scoped_veto(text: str) -> tuple[bool, str]:
+    """Has upstream already scoped the fine-grained-hit veto itself?
+
+    True only when the veto suite still exists AND already filters on a
+    prefix-caching attribute. A veto that is merely edited, moved or deleted is
+    NOT "fixed upstream" -- that is drift, and drift must fail closed.
+    """
+    if GATE_OLD in text:
+        return False, "the unscoped upstream veto is still present verbatim"
+    for block in partial_hit_gate_blocks(text):
+        if "supports_fine_grained_hash_lookup" not in block:
+            continue
+        for attr in SCOPE_ATTRS:
+            if attr in block:
+                return True, (
+                    f"the veto suite already filters on {attr}, so "
+                    "non-participating scratch groups can no longer veto "
+                    "fine-grained hits"
+                )
+        return False, (
+            "a fine-grained-hit veto is present but is not scoped to "
+            "prefix-caching groups"
+        )
+    return False, "no fine-grained-hit veto suite found"
 
 
 def patched_problems(text: str) -> list[str]:
@@ -491,7 +734,9 @@ def pristine_problems(text: str) -> list[str]:
     for stray in (
         HELPER_BEGIN,
         HELPER_END,
+        "def _glm53_strict_int(",
         "def _glm53_scratch_alignment(",
+        "def _glm53_finegrained_enabled(",
         "def _glm53_connector_receipt(",
         "def _glm53_finegrained_hit_gate(",
         "class Glm53FineGrainedAPCError(",
@@ -541,6 +786,20 @@ def main() -> int:
                 + "; ".join(problems)
             )
         print(f"{P.name}: {MARK} already present and complete - skipping")
+        return 0
+
+    # Upstream may have landed the same fix (vLLM main e126687a). Rebasing the
+    # recipe image onto that vLLM must be a no-op, not a boot failure: there is
+    # nothing left to scope, and this overlay's whole purpose is already served.
+    scoped, detail = upstream_scoped_veto(text)
+    if scoped:
+        print(
+            f"{RUNTIME_TAG} upstream already scopes the veto; nothing to do "
+            f"({detail}). {P.name} left unmodified; the scratch-alignment "
+            "invariant is upstream's own (resolve_kv_cache_block_sizes / "
+            "tokens_per_state). GLM53_FINEGRAINED_APC has no effect on this "
+            "build."
+        )
         return 0
 
     problems = pristine_problems(text)
