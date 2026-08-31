@@ -73,24 +73,24 @@ _cli_ablit_direction="${ABLIT_DIRECTION-}"
 _cli_ablit_layers="${ABLIT_LAYERS-}"
 _cli_ablit_alpha="${ABLIT_ALPHA-}"
 _cli_ablit_mtp="${ABLIT_INCLUDE_MTP-}"
+_cli_extra_env="${GLM53_EXTRA_ENV-}"
 _cli_apc_set="${GLM53_APC_RETENTION_INTERVAL+1}"
 _cli_apc="${GLM53_APC_RETENTION_INTERVAL-}"
 _cli_chunk="${GLM53_MIXED_PREFILL_CHUNK-}"
 _cli_warm="${GLM53_MIXED_PREFILL_WARM_TOKENS-}"
 _cli_wait="${GLM53_MIXED_PREFILL_MAX_WAIT_MS-}"
 _cli_late="${GLM53_MIXED_PREFILL_LATE_CAP-}"
-_cli_extra_env="${GLM53_EXTRA_ENV-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
 set +a
 [ -n "${_cli_mtp}" ] && MTP_TOKENS="$_cli_mtp"
+[ -n "${_cli_extra_env}" ] && GLM53_EXTRA_ENV="$_cli_extra_env"
 [ -n "${_cli_apc_set}" ] && GLM53_APC_RETENTION_INTERVAL="$_cli_apc"
 [ -n "${_cli_chunk}" ] && GLM53_MIXED_PREFILL_CHUNK="$_cli_chunk"
 [ -n "${_cli_warm}" ] && GLM53_MIXED_PREFILL_WARM_TOKENS="$_cli_warm"
 [ -n "${_cli_wait}" ] && GLM53_MIXED_PREFILL_MAX_WAIT_MS="$_cli_wait"
 [ -n "${_cli_late}" ] && GLM53_MIXED_PREFILL_LATE_CAP="$_cli_late"
-[ -n "${_cli_extra_env}" ] && GLM53_EXTRA_ENV="$_cli_extra_env"
 [ -n "${_cli_spec}" ] && SPEC_METHOD="$_cli_spec"
 [ -n "${_cli_eager}" ] && ENFORCE_EAGER="$_cli_eager"
 [ -n "${_cli_fused}" ] && EXL3_FUSED_MOE="$_cli_fused"
@@ -241,6 +241,8 @@ GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # Mixed-step prefill policy when a peer is already decoding (issue #6).
 # skip = do not mix; N>0 = cap tokens; 0 = off.
 GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-skip}"
+# Space-separated NAME=VALUE list of extra env for both container ranks (diagnostics, e.g. VLLM_DEBUG_WORKSPACE=1).
+GLM53_EXTRA_ENV="${GLM53_EXTRA_ENV:-}"
 # Sparse prefix-cache snapshot retention (tokens; positive multiple of 3584, <= 1,000,000).
 # Keeps one mamba/drafter state snapshot per interval instead of one per 3584-token
 # block, so two long conversations no longer evict each other from the shared
@@ -253,8 +255,6 @@ GLM53_APC_RETENTION_INTERVAL="${GLM53_APC_RETENTION_INTERVAL-}"
 GLM53_MIXED_PREFILL_WARM_TOKENS="${GLM53_MIXED_PREFILL_WARM_TOKENS:-3584}"
 GLM53_MIXED_PREFILL_MAX_WAIT_MS="${GLM53_MIXED_PREFILL_MAX_WAIT_MS:-1500}"
 GLM53_MIXED_PREFILL_LATE_CAP="${GLM53_MIXED_PREFILL_LATE_CAP:-512}"
-# Space-separated NAME=VALUE list of extra env for both container ranks (diagnostics, e.g. VLLM_DEBUG_WORKSPACE=1).
-GLM53_EXTRA_ENV="${GLM53_EXTRA_ENV:-}"
 # EngineCore stock timeout is 300s; mid-serve Triton/TileLang JIT on TP=2 can
 # exceed that without being a true hang. NCCL watchdog is still 600s.
 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
@@ -1152,11 +1152,13 @@ launch_cluster() {
         log "prefix-cache snapshot retention interval: ${VLLM_PREFIX_CACHE_RETENTION_INTERVAL} tokens (exported to both ranks; read by the head EngineCore)"
     else
         log "prefix-cache snapshot retention: dense (VLLM_PREFIX_CACHE_RETENTION_INTERVAL unset)"
+    fi
     # Per-group APC retention for the DFlash2 drafter SWA group (overlay patch_apc_per_group_retention.py).
     # "" = auto (reachable boundaries only), 0 = boundaries only, N = multiple of the scheduler block.
     if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ]; then
         nccl_common+=(-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA=$GLM53_APC_RETENTION_INTERVAL_SWA")
         log "drafter (SWA) prefix-cache retention interval: ${GLM53_APC_RETENTION_INTERVAL_SWA} (both ranks)"
+    fi
     # Extra container env for diagnostics (space-separated NAME=VALUE list, e.g. GLM53_EXTRA_ENV="VLLM_DEBUG_WORKSPACE=1").
     # Applied to both ranks. Names must be [A-Z_][A-Z0-9_]*; anything else aborts the launch.
     if [ -n "${GLM53_EXTRA_ENV:-}" ]; then
