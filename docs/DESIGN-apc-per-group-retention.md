@@ -612,3 +612,16 @@ machinery so the change is opt-out.
 A third, smaller upstream note worth filing separately: `SlidingWindowManager.find_longest_cache_hit`'s
 `TODO` at `S:938-943` (skip `sliding_window_contiguous_blocks` on a miss) becomes materially more
 valuable once SWA groups cache sparsely — it turns the miss scan from O(n) into O(n/need + need).
+
+
+## 9.1 Initialized-KV evidence (Codex final pass, finding 2)
+What can be proven from code today: a drafter (SWA) miss at a boundary is served by `add_local_computed_blocks` padding
+nulls and `allocate_new_blocks` pulling a fresh window whose block ids are recorded via `_record_new_block_ids`
+(single_type_kv_cache_manager.py:270-286, :332-364), i.e. the drafter never reads another request's data — the blocks are
+either this request's own newly allocated blocks (written by the current prefill/decode) or null blocks. What is NOT proven by
+target-output equivalence is the *quality* of the drafter's proposals right after such a miss (the window is refilled by the
+uncached remainder before decode; a very short remainder leaves part of the window empty) — that is exactly what L5a's
+divergence-suffix sweep (0/1/64/2047/2048) with draft-acceptance deltas measures, with `GLM53_APC_RETENTION_INTERVAL_SWA=14336`
+as the documented fallback if acceptance drops below the 0.90× gate at any suffix. A runtime assertion that every drafter block
+read belongs to the current request is out of scope for this overlay (it would live in the attention backend's block-table
+validation); the block-table plumbing above is the guarantee.
