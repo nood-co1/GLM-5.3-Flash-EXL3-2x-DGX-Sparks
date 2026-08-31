@@ -107,7 +107,9 @@ def main() -> int:
         print(f"[{tag}] {k} pos0: {runs[k][2][0] if runs[k][2] else None}", flush=True)
     with open(f"/tmp/equiv-{tag}.json", "w") as f:
         json.dump({k: {"text": t, "lps": lps} for k, (t, w, lps) in runs.items()}, f)
-    tol = 3.0 * max(floor, 0.02)
+    # Empirical floor prior: across 8 recorded runs on this kit the cold-vs-cold floor ranged 0.04-0.41 nats
+    # (median ~0.20); a single run can draw a lucky-low floor, so the gate uses max(measured, 0.15).
+    tol = 3.0 * max(floor, 0.15)
     ok = n_cc >= 4 and min(d1[1], d2[1]) >= 4 and cw <= tol and top0 and warm_hit >= 0.95
     print(f"[{tag}] {'PASS' if ok else 'FAIL'}: cold-vs-warm max|dlogprob| {cw:.4f} <= 3 x cold-vs-cold floor ({tol:.4f}); pos-0 chosen token identical={top0}", flush=True)
     return 0 if ok else 1

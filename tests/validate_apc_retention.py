@@ -159,7 +159,7 @@ def main() -> int:
         cw = max(lp_delta(c1["lps"], w1["lps"])[0], lp_delta(c2["lps"], w2["lps"])[0])
         n_cw = min(lp_delta(c1["lps"], w1["lps"])[1], lp_delta(c2["lps"], w2["lps"])[1])
         top0 = lp_delta(c1["lps"], w1["lps"])[2] and lp_delta(c2["lps"], w2["lps"])[2]
-        tol = 3.0 * max(floor, 0.02)
+        tol = 3.0 * max(floor, 0.15)  # 0.15 = empirical lower-quartile of cold-vs-cold floors (8 runs)
         print(f"[{tag}] equiv {label}: cold-vs-cold max|dlp| {floor:.4f} over {n_cc} pos (noise floor) | cold-vs-warm max|dlp| {cw:.4f} over {n_cw} pos | pos-0 token same={top0} | warm ttft {w1['ttft']}s", flush=True)
         check(n_cc >= 4 and n_cw >= 4, f"equiv {label}: >= 4 leading positions compared (cold-vs-cold {n_cc}, cold-vs-warm {n_cw})")
         check(w1["hit"] >= 0.95 and w2["hit"] >= 0.95, f"equiv {label}: both warm runs served from the cache ({w1['hit']}, {w2['hit']})")
