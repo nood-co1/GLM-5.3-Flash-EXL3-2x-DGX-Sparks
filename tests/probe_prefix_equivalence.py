@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Cold-vs-cold determinism control for the prefix cache (live; idle server).
 
-Same 45K prompt + prose task, 64 tokens, temp 0 with per-token logprobs: cold1 (cache_salt s1), cold2 (cache_salt s2 = same
-tokens, disjoint hash chain = a second cold prefill), warm1/warm2 (salt s1 again, prefix served from the cache). Reports the
+Same 45K prompt + prose task, 64 tokens, temp 0 with per-token logprobs: cold1/cold2/cold3
+(three disjoint cache_salt namespaces = three independent cold prefills; the noise floor is the MAX of the three pairwise
+max-|dlogprob| values — a single cold pair proved too noisy: floors 0.04-0.41 across runs), then warm1/warm2 (re-runs of the
+s1/s2 namespaces, prefix served from the cache). Reports the
 max |dlogprob| of the chosen token over agreeing positions for cold-vs-cold (noise floor) and cold-vs-warm, the position-0
 chosen-token agreement, and first-divergence indices for information. Refuses to run on a busy server; requires the warm
 runs to be served from the cache (hit >= 0.95) and >= 4 leading agreeing positions. Exits 1 if cold-vs-warm exceeds
@@ -87,7 +89,7 @@ def main() -> int:
         "\nWrite a Python function that parses these ledger rows into a dict keyed by row number and returns the count. Code only."
         if task == "code" else
         "\nIn about 300 words, explain what an audit reconciliation is and why row-level checks matter.")
-    runs = {"cold1": gen(prompt, f"{run}-s1"), "cold2": gen(prompt, f"{run}-s2")}
+    runs = {"cold1": gen(prompt, f"{run}-s1"), "cold2": gen(prompt, f"{run}-s2"), "cold3": gen(prompt, f"{run}-s3")}
     q0, h0 = hits_delta()
     runs["warm1"] = gen(prompt, f"{run}-s1"); runs["warm2"] = gen(prompt, f"{run}-s2")   # warm re-runs of each namespace
     time.sleep(3); q1, h1 = hits_delta()
@@ -95,11 +97,12 @@ def main() -> int:
     print(f"[{tag}] warm runs prefix-cache hit ratio {warm_hit:.3f}", flush=True)
     for k, (t, w, lps) in runs.items():
         print(f"[{tag}] {k}: {w}s len={len(t)} logprob positions={len(lps)}", flush=True)
-    floor, n_cc, top0_cc = lp_delta(runs["cold1"][2], runs["cold2"][2])
+    f12 = lp_delta(runs["cold1"][2], runs["cold2"][2]); f13 = lp_delta(runs["cold1"][2], runs["cold3"][2]); f23 = lp_delta(runs["cold2"][2], runs["cold3"][2])
+    floor = max(f12[0], f13[0], f23[0]); n_cc = min(f12[1], f13[1], f23[1]); top0_cc = f12[2] and f13[2] and f23[2]
     d1 = lp_delta(runs["cold1"][2], runs["warm1"][2]); d2 = lp_delta(runs["cold2"][2], runs["warm2"][2])
     cw = max(d1[0], d2[0]); top0 = d1[2] and d2[2]
     print(f"[{tag}] text first-divergence: cold-vs-cold @{diverge(runs['cold1'][0], runs['cold2'][0])} | cold-vs-warm @{diverge(runs['cold1'][0], runs['warm1'][0])} | warm-vs-warm @{diverge(runs['warm1'][0], runs['warm2'][0])}", flush=True)
-    print(f"[{tag}] max|dlogprob|: cold-vs-cold {floor:.4f} ({n_cc} pos, pos-0 token same={top0_cc}) | cold-vs-warm {cw:.4f} ({min(d1[1], d2[1])} pos) | pos-0 token same={top0}", flush=True)
+    print(f"[{tag}] max|dlogprob|: cold-vs-cold floor {floor:.4f} (pairs {f12[0]:.4f}/{f13[0]:.4f}/{f23[0]:.4f}, {n_cc} pos, pos-0 same={top0_cc}) | cold-vs-warm {cw:.4f} ({min(d1[1], d2[1])} pos) | pos-0 token same={top0}", flush=True)
     for k in ("cold1", "cold2", "warm1", "warm2"):
         print(f"[{tag}] {k} pos0: {runs[k][2][0] if runs[k][2] else None}", flush=True)
     with open(f"/tmp/equiv-{tag}.json", "w") as f:
