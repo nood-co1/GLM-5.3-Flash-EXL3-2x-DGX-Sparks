@@ -73,6 +73,8 @@ _cli_ablit_direction="${ABLIT_DIRECTION-}"
 _cli_ablit_layers="${ABLIT_LAYERS-}"
 _cli_ablit_alpha="${ABLIT_ALPHA-}"
 _cli_ablit_mtp="${ABLIT_INCLUDE_MTP-}"
+_cli_indexer_workspace_set="${GLM53_INDEXER_WORKSPACE+1}"
+_cli_indexer_workspace="${GLM53_INDEXER_WORKSPACE-}"
 _cli_apc_swa_set="${GLM53_APC_RETENTION_INTERVAL_SWA+1}"
 _cli_apc_swa="${GLM53_APC_RETENTION_INTERVAL_SWA-}"
 _cli_finegrained="${GLM53_FINEGRAINED_APC-}"
@@ -89,6 +91,7 @@ set -a
 source "$SCRIPT_DIR/.env"
 set +a
 [ -n "${_cli_mtp}" ] && MTP_TOKENS="$_cli_mtp"
+[ -n "${_cli_indexer_workspace_set}" ] && GLM53_INDEXER_WORKSPACE="$_cli_indexer_workspace"
 [ -n "${_cli_apc_swa_set}" ] && GLM53_APC_RETENTION_INTERVAL_SWA="$_cli_apc_swa"
 [ -n "${_cli_finegrained}" ] && GLM53_FINEGRAINED_APC="$_cli_finegrained"
 [ -n "${_cli_extra_env_set}" ] && GLM53_EXTRA_ENV="$_cli_extra_env"
@@ -193,6 +196,7 @@ SCHED_PATCH_HOST="${SCHED_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_scheduler_decode
 DRAFTER_PATCH_HOST="${DRAFTER_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm5_drafter_group.py}"
 APC_PATCH_HOST="${APC_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_hybrid_prefix_hit.py}"
 FINEHIT_PATCH_HOST="${FINEHIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_fine_grained_hits.py}"
+WORKSPACE_PATCH_HOST="${WORKSPACE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_indexer_workspace.py}"
 PERGROUP_PATCH_HOST="${PERGROUP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_per_group_retention.py}"
 XGRAMMAR_PATCH_HOST="${XGRAMMAR_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_xgrammar_termination.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
@@ -248,6 +252,8 @@ GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # Mixed-step prefill policy when a peer is already decoding (issue #6).
 # skip = do not mix; N>0 = cap tokens; 0 = off.
 GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-skip}"
+# stock | rightsize — indexer prefill workspace sizing (overlay patch_indexer_workspace.py).
+GLM53_INDEXER_WORKSPACE="${GLM53_INDEXER_WORKSPACE-stock}"
 # 1 = fine-grained (64-token) prefix-cache hits (overlay patch_apc_fine_grained_hits.py); 0 = upstream 3584-block hits.
 GLM53_FINEGRAINED_APC="${GLM53_FINEGRAINED_APC-1}"
 # Space-separated NAME=VALUE list of extra env for both container ranks (diagnostics, e.g. VLLM_DEBUG_WORKSPACE=1).
@@ -307,6 +313,15 @@ warn() { printf '\033[1;33m[glm53-exl3]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[glm53-exl3]\033[0m ERROR: %s\n' "$*" >&2; exit 1; }
 
 # GLM53 numeric config guard (begin)
+_glm53_validate_enum() {
+    local name="$1" value="$2" allowed
+    shift 2
+    for allowed in "$@"; do
+        [ "$value" = "$allowed" ] && return 0
+    done
+    echo "$name must be one of: $* (got: $value)" >&2
+    return 2
+}
 _glm53_validate_bool_flag() {
     local name="$1" value="$2"
     if [ "$value" != 0 ] && [ "$value" != 1 ]; then
@@ -366,6 +381,8 @@ validate_numeric_config() {
     _glm53_canonical_positive_int MAX_MODEL_LEN "$MAX_MODEL_LEN" 1000000 || return
     _glm53_canonical_positive_int MAX_NUM_SEQS "$MAX_NUM_SEQS" 4096 || return
     _glm53_canonical_positive_int MAX_NUM_BATCHED_TOKENS "$MAX_NUM_BATCHED_TOKENS" 8388608 || return
+    _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-stock}" \
+        stock rightsize || return
     _glm53_validate_bool_flag GLM53_FINEGRAINED_APC "${GLM53_FINEGRAINED_APC-1}" || return
     glm53_apc_retention_env "${GLM53_APC_RETENTION_INTERVAL-}" || return
     # mixed-prefill gate v2 knobs (self-defaulting so the guard block runs standalone; 0 = feature off for the first two)
@@ -521,6 +538,7 @@ preflight() {
     [ -f "$DRAFTER_PATCH_HOST" ] || die "$DRAFTER_PATCH_HOST missing"
     [ -f "$APC_PATCH_HOST" ] || die "$APC_PATCH_HOST missing"
     [ -f "$FINEHIT_PATCH_HOST" ] || die "$FINEHIT_PATCH_HOST missing"
+    [ -f "$WORKSPACE_PATCH_HOST" ] || die "$WORKSPACE_PATCH_HOST missing"
     [ -f "$PERGROUP_PATCH_HOST" ] || die "$PERGROUP_PATCH_HOST missing"
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "$XGRAMMAR_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
@@ -986,6 +1004,9 @@ fi
 if [ -f /opt/glm53/patch_apc_fine_grained_hits.py ]; then
     python3 /opt/glm53/patch_apc_fine_grained_hits.py
 fi
+if [ -f /opt/glm53/patch_indexer_workspace.py ]; then
+    python3 /opt/glm53/patch_indexer_workspace.py
+fi
 if [ -f /opt/glm53/patch_apc_per_group_retention.py ]; then
     python3 /opt/glm53/patch_apc_per_group_retention.py
 fi
@@ -1082,6 +1103,9 @@ fi
 if [ -f /opt/glm53/patch_apc_fine_grained_hits.py ]; then
     python3 /opt/glm53/patch_apc_fine_grained_hits.py
 fi
+if [ -f /opt/glm53/patch_indexer_workspace.py ]; then
+    python3 /opt/glm53/patch_indexer_workspace.py
+fi
 if [ -f /opt/glm53/patch_apc_per_group_retention.py ]; then
     python3 /opt/glm53/patch_apc_per_group_retention.py
 fi
@@ -1125,9 +1149,11 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$DRAFTER_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_glm5_drafter_group.py"
     [ -f "$APC_PATCH_HOST" ] || die "missing $APC_PATCH_HOST"
     [ -f "$FINEHIT_PATCH_HOST" ] || die "missing $FINEHIT_PATCH_HOST"
+    [ -f "$WORKSPACE_PATCH_HOST" ] || die "missing $WORKSPACE_PATCH_HOST"
     [ -f "$PERGROUP_PATCH_HOST" ] || die "missing $PERGROUP_PATCH_HOST"
     scp -q -o BatchMode=yes "$APC_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_hybrid_prefix_hit.py"
     scp -q -o BatchMode=yes "$FINEHIT_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_apc_fine_grained_hits.py"
+    scp -q -o BatchMode=yes "$WORKSPACE_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_indexer_workspace.py"
     scp -q -o BatchMode=yes "$PERGROUP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_apc_per_group_retention.py"
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "missing $XGRAMMAR_PATCH_HOST"
     scp -q -o BatchMode=yes "$XGRAMMAR_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_xgrammar_termination.py"
@@ -1156,6 +1182,7 @@ launch_cluster() {
         -e VLLM_CACHE_ROOT=/root/.cache/vllm
         -e "GLM53_SUPPRESS_STOPS_IN_REASONING=$GLM53_SUPPRESS_STOPS_IN_REASONING"
         -e "GLM53_MIXED_PREFILL_CHUNK=$GLM53_MIXED_PREFILL_CHUNK"
+        -e "GLM53_INDEXER_WORKSPACE=$GLM53_INDEXER_WORKSPACE"
         -e "GLM53_FINEGRAINED_APC=$GLM53_FINEGRAINED_APC"
         -e "GLM53_MIXED_PREFILL_WARM_TOKENS=$GLM53_MIXED_PREFILL_WARM_TOKENS"
         -e "GLM53_MIXED_PREFILL_MAX_WAIT_MS=$GLM53_MIXED_PREFILL_MAX_WAIT_MS"
@@ -1264,6 +1291,7 @@ launch_cluster() {
         -v '/tmp/patch_glm5_drafter_group.py:/opt/glm53/patch_glm5_drafter_group.py:ro' \
         -v '/tmp/patch_hybrid_prefix_hit.py:/opt/glm53/patch_hybrid_prefix_hit.py:ro' \
         -v '/tmp/patch_apc_fine_grained_hits.py:/opt/glm53/patch_apc_fine_grained_hits.py:ro' \
+        -v '/tmp/patch_indexer_workspace.py:/opt/glm53/patch_indexer_workspace.py:ro' \
         -v '/tmp/patch_apc_per_group_retention.py:/opt/glm53/patch_apc_per_group_retention.py:ro' \
         -v '/tmp/patch_xgrammar_termination.py:/opt/glm53/patch_xgrammar_termination.py:ro' \
         -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
@@ -1297,6 +1325,7 @@ launch_cluster() {
         -v "$DRAFTER_PATCH_HOST:/opt/glm53/patch_glm5_drafter_group.py:ro" \
         -v "$APC_PATCH_HOST:/opt/glm53/patch_hybrid_prefix_hit.py:ro" \
         -v "$FINEHIT_PATCH_HOST:/opt/glm53/patch_apc_fine_grained_hits.py:ro" \
+        -v "$WORKSPACE_PATCH_HOST:/opt/glm53/patch_indexer_workspace.py:ro" \
         -v "$PERGROUP_PATCH_HOST:/opt/glm53/patch_apc_per_group_retention.py:ro" \
         -v "$XGRAMMAR_PATCH_HOST:/opt/glm53/patch_xgrammar_termination.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
