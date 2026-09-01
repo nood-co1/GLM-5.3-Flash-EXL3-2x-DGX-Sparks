@@ -419,6 +419,34 @@ _glm53_canonical_positive_int() {
     export "$name"
 }
 
+# Retention-interval grid and cap for the forwarded per-group SWA knob (#83
+# hardening): empty = auto, 0 = boundaries only, else a positive multiple of
+# the hybrid scheduler block <= max_model_len; canonicalised (leading zeros
+# stripped) so both ranks receive the same text.
+GLM53_APC_BLOCK_TOKENS=3584
+GLM53_APC_RETENTION_MAX=1000000
+_glm53_validate_retention_interval() {
+    local name="$1" value="$2" canonical
+    [ -n "$value" ] || return 0
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$name must be empty, 0, or a positive multiple of $GLM53_APC_BLOCK_TOKENS <= $GLM53_APC_RETENTION_MAX (got: $value)" >&2
+        return 2
+    fi
+    canonical="$value"
+    while [ "${canonical#0}" != "$canonical" ]; do canonical="${canonical#0}"; done
+    [ -n "$canonical" ] || canonical=0
+    if [ "$canonical" != 0 ] \
+       && { [ "${#canonical}" -gt "${#GLM53_APC_RETENTION_MAX}" ] \
+            || [ "$canonical" -gt "$GLM53_APC_RETENTION_MAX" ] \
+            || [ $((canonical % GLM53_APC_BLOCK_TOKENS)) -ne 0 ]; }; then
+        echo "$name must be empty, 0, or a positive multiple of $GLM53_APC_BLOCK_TOKENS <= $GLM53_APC_RETENTION_MAX (got: $value)" >&2
+        return 2
+    fi
+    printf -v "$name" '%s' "$canonical"
+    # shellcheck disable=SC2163
+    export "$name"
+}
+
 validate_numeric_config() {
     if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
        || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
@@ -437,6 +465,9 @@ validate_numeric_config() {
     _glm53_validate_bool_flag GLM53_FINEGRAINED_APC "${GLM53_FINEGRAINED_APC-1}" || return
     _glm53_validate_bool_flag GLM53_APC_NO_STORE "${GLM53_APC_NO_STORE-1}" || return
     _glm53_validate_bool_flag GLM53_KV_CAPACITY_LOG "${GLM53_KV_CAPACITY_LOG-1}" || return
+    # GLM53_APC_RETENTION_INTERVAL (global knob, PR #79) keeps glm53_apc_retention_env above;
+    # the forwarded per-group SWA knob takes the #83 validator (validate-what-you-forward).
+    _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL_SWA "${GLM53_APC_RETENTION_INTERVAL_SWA-}" || return
     glm53_apc_retention_env "${GLM53_APC_RETENTION_INTERVAL-}" || return
     # mixed-prefill gate v2 knobs (self-defaulting so the guard block runs standalone; 0 = feature off for the first two)
     GLM53_MIXED_PREFILL_WARM_TOKENS="${GLM53_MIXED_PREFILL_WARM_TOKENS:-3584}"
