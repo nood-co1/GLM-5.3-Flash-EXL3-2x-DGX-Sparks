@@ -547,6 +547,14 @@ validate_numeric_config() {
     _glm53_validate_bool_flag GLM53_KV_OFFLOAD "${GLM53_KV_OFFLOAD-0}" || return
     _glm53_validate_bool_flag GLM53_KV_OFFLOAD_RESTORE "${GLM53_KV_OFFLOAD_RESTORE-0}" || return
     _glm53_validate_bool_flag GLM53_KV_OFFLOAD_DRAFTER "${GLM53_KV_OFFLOAD_DRAFTER-0}" || return
+    # test/alloc-iso scratch-branch flag (diagnostics only, never merges):
+    # exact 0/1, and =1 is legal only on knob=0 boots — refused here PRE-STOP
+    # so a mis-set flag never takes the healthy pair down.
+    _glm53_validate_bool_flag GLM53_TEST_DROP_ALLOC_CONF "${GLM53_TEST_DROP_ALLOC_CONF-0}" || return
+    if [ "${GLM53_TEST_DROP_ALLOC_CONF-0}" = 1 ] && [ "${GLM53_KV_OFFLOAD-0}" = 1 ]; then
+        echo "GLM53_TEST_DROP_ALLOC_CONF is a diagnostics-only flag for knob=0 boots (knob=1 already drops the env)" >&2
+        return 2
+    fi
     # Stage-2 rule: restore reads the store tier, so RESTORE=1 without the
     # store knob is meaningless (a lookup with nothing behind it) and is
     # refused fail-closed pre-stop.
