@@ -1531,7 +1531,10 @@ launch_cluster() {
     # (torch default allocator); knob=0 boots keep the stock entry, container
     # env byte-identical to a build without the tier.
     local -a alloc_conf_env=(-e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True)
-    if [ "${GLM53_KV_OFFLOAD-0}" = 1 ]; then
+    if [ "${GLM53_TEST_DROP_ALLOC_CONF-0}" = 1 ] && [ "${GLM53_KV_OFFLOAD-0}" = 1 ]; then
+        die "GLM53_TEST_DROP_ALLOC_CONF is a diagnostics-only flag for knob=0 boots (knob=1 already drops the env)"
+    fi
+    if [ "${GLM53_KV_OFFLOAD-0}" = 1 ] || [ "${GLM53_TEST_DROP_ALLOC_CONF-0}" = 1 ]; then
         alloc_conf_env=()
         log "kv-offload: PYTORCH_CUDA_ALLOC_CONF (expandable_segments:True) dropped on both ranks (vllm rejects OffloadingConnector with it unless CuMem allocator is enabled)"
     fi
