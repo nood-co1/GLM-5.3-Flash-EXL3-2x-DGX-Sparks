@@ -345,12 +345,19 @@ def part_b(h: Harness) -> None:
     restart = text.index("restart)  stop; start", main_at)
     check(v_num < restart and v_art < restart, "B1 main() runs both validators before `restart) stop; start`")
     check(
-        "start|restart) validate_numeric_config; validate_overlay_artifacts ;;" in text,
+        "start|restart) validate_numeric_config; validate_overlay_artifacts; validate_kv_offload_artifacts ;;" in text,
         "B1 the validators share the start|restart arm",
     )
     guard_begin = text.index("# GLM53 overlay artifact guard (begin)")
     guard_end = text.index("# GLM53 overlay artifact guard (end)")
     guard = text[guard_begin:guard_end]
+    # deploy/dogfood-next4: the kv-offload branches ship their own pre-stop
+    # artifact guard (validate_kv_offload_artifacts, same |identity|EOF-sentinel
+    # technique plus --check-injected); its *_PATCH_HOST entries live there.
+    kvo_begin = text.index("# GLM53 kv-offload artifact guard (begin)")
+    kvo_end = text.index("# GLM53 kv-offload artifact guard (end)")
+    kvo_guard = text[kvo_begin:kvo_end]
+    check(kvo_begin < kvo_end, "B1 the kv-offload artifact guard has its own sentinel block")
     check(guard_begin < guard_end, "B1 the artifact guard has its own sentinel block")
     check("|-\"" not in guard and '|-"' not in guard, "B1 every artifact carries an identity string (no untagged entries)")
     check(
@@ -370,7 +377,9 @@ def part_b(h: Harness) -> None:
         "B2 checkout ships at least one of per-group / fine-grained / no-store / kv-capacity-log",
     )
     for var in vars_:
-        check(f'"${var}|' in guard, f"B2 {var} ({vars_[var]}) is in the artifact guard")
+        target = kvo_guard if var.startswith("KVOFFLOAD_") else guard
+        which = "kv-offload artifact guard" if var.startswith("KVOFFLOAD_") else "artifact guard"
+        check(f'"${var}|' in target, f"B2 {var} ({vars_[var]}) is in the {which}")
     check("overlay/patch_ablit.py|" in guard and "overlay/ablit_runtime.py|" in guard, "B2 ablit hook + runtime are in the artifact guard")
     check(
         'for entry in "${artifacts[@]}"' in guard and "artifacts[@]}\" -eq 0" in guard,

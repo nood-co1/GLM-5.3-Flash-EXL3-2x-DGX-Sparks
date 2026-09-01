@@ -735,7 +735,12 @@ def part_c() -> None:
     check('GLM53_KV_CAPACITY_LOG="${GLM53_KV_CAPACITY_LOG-1}"' in src, "C1 default 1 applies only when UNSET")
     check('KVCAP_PATCH_HOST="${KVCAP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kv_capacity_log.py}"' in src, "C2 KVCAP_PATCH_HOST defaults to the shipped overlay")
     check('"$KVCAP_PATCH_HOST|[glm53-kv-capacity-log]|$main_guard"' in src and "validate_overlay_artifacts" in src, "C2 the overlay is in the fail-closed artifact guard (identity string + EOF sentinel)")
-    check("start|restart) validate_numeric_config; validate_overlay_artifacts ;;" in src, "C2 the guard runs on start|restart before anything else in main()")
+    # deploy/dogfood-next4: the kv-offload guard joins the same pre-stop arm.
+    check(
+        "start|restart) validate_numeric_config; validate_overlay_artifacts ;;" in src
+        or "start|restart) validate_numeric_config; validate_overlay_artifacts; validate_kv_offload_artifacts ;;" in src,
+        "C2 the guard runs on start|restart before anything else in main()",
+    )
     check('[ -f "$KVCAP_PATCH_HOST" ] || die "$KVCAP_PATCH_HOST missing"' in src and 'scp -q -o BatchMode=yes "$KVCAP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kv_capacity_log.py"' in src, "C2 preflight existence check + scp to the worker")
     check("-v '/tmp/patch_kv_capacity_log.py:/opt/glm53/patch_kv_capacity_log.py:ro'" in src and '-v "$KVCAP_PATCH_HOST:/opt/glm53/patch_kv_capacity_log.py:ro"' in src, "C2 read-only mount on both ranks")
     check('-e "GLM53_KV_CAPACITY_LOG=$GLM53_KV_CAPACITY_LOG"' in src, "C2 the knob is forwarded in nccl_common (both ranks)")
