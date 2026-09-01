@@ -95,6 +95,16 @@ _cli_chunk="${GLM53_MIXED_PREFILL_CHUNK-}"
 _cli_warm="${GLM53_MIXED_PREFILL_WARM_TOKENS-}"
 _cli_wait="${GLM53_MIXED_PREFILL_MAX_WAIT_MS-}"
 _cli_late="${GLM53_MIXED_PREFILL_LATE_CAP-}"
+_cli_kvoffload_set="${GLM53_KV_OFFLOAD+1}"
+_cli_kvoffload="${GLM53_KV_OFFLOAD-}"
+_cli_kvoffload_dir_set="${GLM53_KV_OFFLOAD_DIR+1}"
+_cli_kvoffload_dir="${GLM53_KV_OFFLOAD_DIR-}"
+_cli_kvoffload_cpu_set="${GLM53_KV_OFFLOAD_CPU_GB+1}"
+_cli_kvoffload_cpu="${GLM53_KV_OFFLOAD_CPU_GB-}"
+_cli_kvoffload_restore_set="${GLM53_KV_OFFLOAD_RESTORE+1}"
+_cli_kvoffload_restore="${GLM53_KV_OFFLOAD_RESTORE-}"
+_cli_kvoffload_drafter_set="${GLM53_KV_OFFLOAD_DRAFTER+1}"
+_cli_kvoffload_drafter="${GLM53_KV_OFFLOAD_DRAFTER-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
@@ -112,6 +122,11 @@ set +a
 [ -n "${_cli_warm}" ] && GLM53_MIXED_PREFILL_WARM_TOKENS="$_cli_warm"
 [ -n "${_cli_wait}" ] && GLM53_MIXED_PREFILL_MAX_WAIT_MS="$_cli_wait"
 [ -n "${_cli_late}" ] && GLM53_MIXED_PREFILL_LATE_CAP="$_cli_late"
+[ -n "${_cli_kvoffload_set}" ] && GLM53_KV_OFFLOAD="$_cli_kvoffload"
+[ -n "${_cli_kvoffload_dir_set}" ] && GLM53_KV_OFFLOAD_DIR="$_cli_kvoffload_dir"
+[ -n "${_cli_kvoffload_cpu_set}" ] && GLM53_KV_OFFLOAD_CPU_GB="$_cli_kvoffload_cpu"
+[ -n "${_cli_kvoffload_restore_set}" ] && GLM53_KV_OFFLOAD_RESTORE="$_cli_kvoffload_restore"
+[ -n "${_cli_kvoffload_drafter_set}" ] && GLM53_KV_OFFLOAD_DRAFTER="$_cli_kvoffload_drafter"
 [ -n "${_cli_spec}" ] && SPEC_METHOD="$_cli_spec"
 [ -n "${_cli_eager}" ] && ENFORCE_EAGER="$_cli_eager"
 [ -n "${_cli_fused}" ] && EXL3_FUSED_MOE="$_cli_fused"
@@ -215,6 +230,9 @@ WORKSPACE_PATCH_HOST="${WORKSPACE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_indexer_
 PERGROUP_PATCH_HOST="${PERGROUP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_per_group_retention.py}"
 NOSTORE_PATCH_HOST="${NOSTORE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_no_store.py}"
 KVCAP_PATCH_HOST="${KVCAP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kv_capacity_log.py}"
+KVOFFLOAD_SCOPE_PATCH_HOST="${KVOFFLOAD_SCOPE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kv_offload_scope.py}"
+KVOFFLOAD_STORE_PATCH_HOST="${KVOFFLOAD_STORE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kv_offload_store_local.py}"
+KVOFFLOAD_RESTORE_PATCH_HOST="${KVOFFLOAD_RESTORE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kv_offload_restore_g0.py}"
 XGRAMMAR_PATCH_HOST="${XGRAMMAR_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_xgrammar_termination.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
@@ -323,6 +341,33 @@ GLM53_APC_RETENTION_INTERVAL="${GLM53_APC_RETENTION_INTERVAL-}"
 GLM53_MIXED_PREFILL_WARM_TOKENS="${GLM53_MIXED_PREFILL_WARM_TOKENS:-3584}"
 GLM53_MIXED_PREFILL_MAX_WAIT_MS="${GLM53_MIXED_PREFILL_MAX_WAIT_MS:-1500}"
 GLM53_MIXED_PREFILL_LATE_CAP="${GLM53_MIXED_PREFILL_LATE_CAP:-512}"
+# --- disk KV-offload store tier (stage 1: store-only) -----------------------
+# 1 = enable the OffloadingConnector (CPU staging + worker-local per-rank disk
+# writes under overlay patch_kv_offload_scope.py + patch_kv_offload_store_local.py).
+# 0 (default) = OFF: no --kv-transfer-config, no store mount — serving is
+# byte-identical to a build without the tier. Exactly 0 or 1.
+GLM53_KV_OFFLOAD="${GLM53_KV_OFFLOAD-0}"
+# Host directory for the store (local NVMe on EACH Spark; same path on both;
+# per-rank namespaced subdirs are created by the writer). Mounted rw at
+# $GLM53_KV_OFFLOAD_DIR_CTR in both containers when the knob is 1.
+GLM53_KV_OFFLOAD_DIR="${GLM53_KV_OFFLOAD_DIR:-$HOME/glm53-kv-offload}"
+GLM53_KV_OFFLOAD_DIR_CTR="/data/glm53-kv-offload"
+# CPU staging bounce-buffer size in GiB (cpu_bytes_to_use). Staging only —
+# never a capacity tier (plan non-goal); 4 GiB ≈ 15 aligned boundaries.
+GLM53_KV_OFFLOAD_CPU_GB="${GLM53_KV_OFFLOAD_CPU_GB:-4}"
+# Stage-1 hard rule: restore stays OFF. The launcher REFUSES 1 (stage 2
+# flips this default after the restore plumbing lands + receipts).
+GLM53_KV_OFFLOAD_RESTORE="${GLM53_KV_OFFLOAD_RESTORE-0}"
+# 1 = include the DFlash2 drafter group in the offload eligible set
+# (stage-4 experiment); 0 (default) = policy-excluded (plan §3.2).
+GLM53_KV_OFFLOAD_DRAFTER="${GLM53_KV_OFFLOAD_DRAFTER-0}"
+# Inline manifest retention: keep the K most recent boundary manifests per
+# chain (plan §7; 0 = dense, no inline supersede).
+GLM53_KV_OFFLOAD_KEEP_BOUNDARIES="${GLM53_KV_OFFLOAD_KEEP_BOUNDARIES:-2}"
+# Build identity for the store namespace fence: the recipe checkout SHA (an
+# overlay change that alters byte semantics forks the store). "unpinned"
+# when the checkout is not a git repo.
+GLM53_KV_OFFLOAD_BUILD_ID="${GLM53_KV_OFFLOAD_BUILD_ID:-$(git -C "$SCRIPT_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unpinned)}"
 # EngineCore stock timeout is 300s; mid-serve Triton/TileLang JIT on TP=2 can
 # exceed that without being a true hang. NCCL watchdog is still 600s.
 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
@@ -499,6 +544,37 @@ validate_numeric_config() {
     if [ "$GLM53_MIXED_PREFILL_LATE_CAP" -lt 64 ]; then
         echo "GLM53_MIXED_PREFILL_LATE_CAP must be between 64 and 8192 (got: $GLM53_MIXED_PREFILL_LATE_CAP)" >&2; return 2
     fi
+    _glm53_validate_bool_flag GLM53_KV_OFFLOAD "${GLM53_KV_OFFLOAD-0}" || return
+    _glm53_validate_bool_flag GLM53_KV_OFFLOAD_RESTORE "${GLM53_KV_OFFLOAD_RESTORE-0}" || return
+    _glm53_validate_bool_flag GLM53_KV_OFFLOAD_DRAFTER "${GLM53_KV_OFFLOAD_DRAFTER-0}" || return
+    # Stage-2 rule: restore reads the store tier, so RESTORE=1 without the
+    # store knob is meaningless (a lookup with nothing behind it) and is
+    # refused fail-closed pre-stop.
+    if [ "${GLM53_KV_OFFLOAD_RESTORE-0}" = 1 ] && [ "${GLM53_KV_OFFLOAD-0}" != 1 ]; then
+        echo "GLM53_KV_OFFLOAD_RESTORE=1 requires GLM53_KV_OFFLOAD=1 (the restore path reads the store tier)" >&2
+        return 2
+    fi
+    if [ "${GLM53_KV_OFFLOAD-0}" = 1 ]; then
+        _glm53_canonical_positive_int GLM53_KV_OFFLOAD_CPU_GB "${GLM53_KV_OFFLOAD_CPU_GB-}" 64 || return
+        if ! [[ "${GLM53_KV_OFFLOAD_KEEP_BOUNDARIES-}" =~ ^[0-9]+$ ]] \
+           || [ "${GLM53_KV_OFFLOAD_KEEP_BOUNDARIES-}" -gt 1024 ]; then
+            echo "GLM53_KV_OFFLOAD_KEEP_BOUNDARIES must be an integer 0..1024 (got: ${GLM53_KV_OFFLOAD_KEEP_BOUNDARIES-})" >&2
+            return 2
+        fi
+        case "${GLM53_KV_OFFLOAD_DIR-}" in
+            /*) ;;
+            *)
+                echo "GLM53_KV_OFFLOAD_DIR must be an absolute path (got: ${GLM53_KV_OFFLOAD_DIR-})" >&2
+                return 2
+                ;;
+        esac
+        case "${GLM53_KV_OFFLOAD_DIR-}" in
+            *"'"*|*'"'*|*[$' \t\n']*)
+                echo "GLM53_KV_OFFLOAD_DIR must not contain quotes or whitespace (got: $GLM53_KV_OFFLOAD_DIR)" >&2
+                return 2
+                ;;
+        esac
+    fi
 }
 # GLM53 numeric config guard (end)
 
@@ -584,6 +660,65 @@ validate_overlay_artifacts() {
     fi
 }
 # GLM53 overlay artifact guard (end)
+
+# GLM53 kv-offload artifact guard (begin)
+# The two kv-offload overlays + the GC tool, validated BEFORE `restart` stops
+# anything: a missing, empty, mis-pointed, truncated or syntactically broken
+# artifact is a launcher error with the healthy pair left serving, not a
+# container that dies at boot after the old one is gone. Identity string +
+# exact last non-blank line + ast.parse, per artifact (same technique as the
+# overlay artifact guard on the capacity-log branch; scoped to this PR's
+# artifacts so the two guards merge cleanly).
+validate_kv_offload_artifacts() {
+    local main_guard='    sys.exit(main())'
+    local gc_guard='    sys.exit(main())'
+    local -a artifacts=(
+        "$KVOFFLOAD_SCOPE_PATCH_HOST|[glm53-kv-offload-scope]|$main_guard"
+        "$KVOFFLOAD_STORE_PATCH_HOST|[glm53-kv-offload-store]|$main_guard"
+        "$KVOFFLOAD_RESTORE_PATCH_HOST|[glm53-kv-offload-restore]|$main_guard"
+        "$SCRIPT_DIR/overlay/kv_offload_store_gc.py|glm53kv_<model>_<ns>_r<rank>|$gc_guard"
+    )
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "python3 is required on the head to verify kv-offload artifacts before launch" >&2
+        return 2
+    fi
+    local entry path rest tag tail last
+    for entry in "${artifacts[@]}"; do
+        path="${entry%%|*}"
+        rest="${entry#*|}"
+        tag="${rest%%|*}"
+        tail="${rest#*|}"
+        if [ ! -f "$path" ] || [ ! -r "$path" ] || [ ! -s "$path" ]; then
+            echo "kv-offload artifact missing, unreadable or empty: $path" >&2
+            return 2
+        fi
+        if ! grep -qF -- "$tag" "$path"; then
+            echo "kv-offload artifact $path does not carry its identity string '$tag' (wrong file?)" >&2
+            return 2
+        fi
+        # `|| true`: under pipefail a whitespace-only file makes grep exit 1,
+        # which must surface as the rc=2 diagnostic below, not a bare exit 1.
+        last="$(grep -v '^[[:space:]]*$' "$path" | tail -n 1 || true)"
+        if [ "$last" != "$tail" ]; then
+            echo "kv-offload artifact $path does not end with '$tail' (truncated copy? last line: '$last')" >&2
+            return 2
+        fi
+        if ! python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' "$path" 2>/dev/null; then
+            echo "kv-offload artifact does not parse as Python: $path" >&2
+            return 2
+        fi
+    done
+    # The two patchers embed their in-container code as string literals; a
+    # file that parses can still carry a truncated literal. --check-injected
+    # compiles every injected source standalone (no image access needed).
+    for entry in "$KVOFFLOAD_SCOPE_PATCH_HOST" "$KVOFFLOAD_STORE_PATCH_HOST" "$KVOFFLOAD_RESTORE_PATCH_HOST"; do
+        if ! python3 "$entry" --check-injected >/dev/null 2>&1; then
+            echo "kv-offload artifact failed its injected-source self-check: $entry" >&2
+            return 2
+        fi
+    done
+}
+# GLM53 kv-offload artifact guard (end)
 
 banner() {
     local label="${1:-start.sh}"
@@ -722,6 +857,8 @@ preflight() {
     [ -f "$PERGROUP_PATCH_HOST" ] || die "$PERGROUP_PATCH_HOST missing"
     [ -f "$NOSTORE_PATCH_HOST" ] || die "$NOSTORE_PATCH_HOST missing"
     [ -f "$KVCAP_PATCH_HOST" ] || die "$KVCAP_PATCH_HOST missing"
+    [ -f "$KVOFFLOAD_SCOPE_PATCH_HOST" ] || die "$KVOFFLOAD_SCOPE_PATCH_HOST missing"
+    [ -f "$KVOFFLOAD_STORE_PATCH_HOST" ] || die "$KVOFFLOAD_STORE_PATCH_HOST missing"
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "$XGRAMMAR_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
     [ -f "$SCRIPT_DIR/overlay/patch_ablit.py" ] || die "$SCRIPT_DIR/overlay/patch_ablit.py missing"
@@ -1120,6 +1257,13 @@ sync_weights() {
 # coordinator overlays) and patch_kv_capacity_log (kv_cache_utils.py only,
 # log-only; it must follow patch_glm5_drafter_group, which edits the same
 # file, and has no shared anchors with the coordinator overlays).
+# The kv-offload trio is order-dependent: patch_kv_offload_scope MUST
+# precede patch_kv_offload_store_local (the store overlay anchors on the
+# scope overlay's scheduler output and refuses an unscoped tree), and
+# patch_kv_offload_restore_g0 MUST come last of the three (it anchors on
+# BOTH overlays' output and refuses a tree missing either mark); the trio
+# stays after the prefix-cache overlays (restore's T2 hook anchors the
+# per-group-retention-patched single_type manager) and before xgrammar/kpool.
 # Entries that are not mounted are skipped in-container (`[ -f ]`); which ones
 # MUST exist is decided by the overlay artifact guard above, not here.
 GLM53_OVERLAY_ORDER=(
@@ -1133,6 +1277,9 @@ GLM53_OVERLAY_ORDER=(
     patch_indexer_workspace.py
     patch_apc_no_store.py
     patch_kv_capacity_log.py
+    patch_kv_offload_scope.py
+    patch_kv_offload_store_local.py
+    patch_kv_offload_restore_g0.py
     patch_xgrammar_termination.py
     patch_kpool_tail_slotmap.py
     patch_ablit.py
@@ -1176,6 +1323,16 @@ ARGS=(
 [ -n "${MAX_NUM_SEQS:-}" ] && ARGS+=(--max-num-seqs "${MAX_NUM_SEQS}")
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
+if [ "${GLM53_KV_OFFLOAD:-0}" = "1" ]; then
+    # Stage-1 store tier: CPU staging only (TieringOffloadingSpec, NO
+    # secondary tiers -- the worker-local writer in
+    # patch_kv_offload_store_local.py is the disk tier; the scheduler-side fs
+    # tier is byte-invalid on 2-node TP, see the overlay header).
+    ARGS+=(--kv-transfer-config "$(python3 -S -c 'import json,os
+gb=int(os.environ["GLM53_KV_OFFLOAD_CPU_GB"])
+cfg={"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":gb*(1<<30),"blocks_per_chunk":1,"offload_prompt_only":False}}
+print(json.dumps(cfg,separators=(",",":")))')")
+fi
 if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
     ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
 fi
@@ -1250,6 +1407,16 @@ ARGS=(
 [ -n "${MAX_NUM_SEQS:-}" ] && ARGS+=(--max-num-seqs "${MAX_NUM_SEQS}")
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
+if [ "${GLM53_KV_OFFLOAD:-0}" = "1" ]; then
+    # Stage-1 store tier: CPU staging only (TieringOffloadingSpec, NO
+    # secondary tiers -- the worker-local writer in
+    # patch_kv_offload_store_local.py is the disk tier; the scheduler-side fs
+    # tier is byte-invalid on 2-node TP, see the overlay header).
+    ARGS+=(--kv-transfer-config "$(python3 -S -c 'import json,os
+gb=int(os.environ["GLM53_KV_OFFLOAD_CPU_GB"])
+cfg={"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":gb*(1<<30),"blocks_per_chunk":1,"offload_prompt_only":False}}
+print(json.dumps(cfg,separators=(",",":")))')")
+fi
 if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
     ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
 fi
@@ -1302,6 +1469,18 @@ launch_cluster() {
 
     mkdir -p "$CACHE_ROOT" "$TRITON_HOST_CACHE" "$TILELANG_HOST_CACHE"
     worker_ssh "mkdir -p '$WORKER_VLLM_CACHE' '$WORKER_TRITON_CACHE' '$WORKER_TILELANG_CACHE'"
+
+    # Disk KV-offload store: mount + dir only when the knob is 1 (knob=0 adds
+    # NOTHING to the containers beyond the replayed env — byte-identical boot).
+    local -a head_offload_mount=()
+    local worker_offload_mount=""
+    if [ "$GLM53_KV_OFFLOAD" = 1 ]; then
+        mkdir -p "$GLM53_KV_OFFLOAD_DIR"
+        worker_ssh "mkdir -p '$GLM53_KV_OFFLOAD_DIR'"
+        head_offload_mount=(-v "$GLM53_KV_OFFLOAD_DIR:$GLM53_KV_OFFLOAD_DIR_CTR")
+        worker_offload_mount="-v '$GLM53_KV_OFFLOAD_DIR:$GLM53_KV_OFFLOAD_DIR_CTR'"
+        log "kv-offload store tier ON: $GLM53_KV_OFFLOAD_DIR (both ranks, rw) staging=${GLM53_KV_OFFLOAD_CPU_GB}GiB keep_boundaries=$GLM53_KV_OFFLOAD_KEEP_BOUNDARIES restore=$GLM53_KV_OFFLOAD_RESTORE"
+    fi
     scp -q -o BatchMode=yes "$WORKER_SCRIPT" "${WORKER_SSH}:/tmp/${CONTAINER_WORKER}.sh"
     [ -f "$CHAT_TEMPLATE_HOST" ] || die "missing chat template: $CHAT_TEMPLATE_HOST"
     scp -q -o BatchMode=yes "$CHAT_TEMPLATE_HOST" "${WORKER_SSH}:/tmp/glm53-chat_template.jinja"
@@ -1325,6 +1504,12 @@ launch_cluster() {
     [ -f "$KVCAP_PATCH_HOST" ] || die "missing $KVCAP_PATCH_HOST"
     scp -q -o BatchMode=yes "$NOSTORE_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_apc_no_store.py"
     scp -q -o BatchMode=yes "$KVCAP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kv_capacity_log.py"
+    [ -f "$KVOFFLOAD_SCOPE_PATCH_HOST" ] || die "missing $KVOFFLOAD_SCOPE_PATCH_HOST"
+    scp -q -o BatchMode=yes "$KVOFFLOAD_SCOPE_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kv_offload_scope.py"
+    [ -f "$KVOFFLOAD_STORE_PATCH_HOST" ] || die "missing $KVOFFLOAD_STORE_PATCH_HOST"
+    scp -q -o BatchMode=yes "$KVOFFLOAD_STORE_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kv_offload_store_local.py"
+    [ -f "$KVOFFLOAD_RESTORE_PATCH_HOST" ] || die "missing $KVOFFLOAD_RESTORE_PATCH_HOST"
+    scp -q -o BatchMode=yes "$KVOFFLOAD_RESTORE_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kv_offload_restore_g0.py"
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "missing $XGRAMMAR_PATCH_HOST"
     scp -q -o BatchMode=yes "$XGRAMMAR_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_xgrammar_termination.py"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "missing $KPOOL_TAIL_PATCH_HOST"
@@ -1360,6 +1545,13 @@ launch_cluster() {
         -e "GLM53_MIXED_PREFILL_LATE_CAP=$GLM53_MIXED_PREFILL_LATE_CAP"
         -e "GLM53_APC_NO_STORE=$GLM53_APC_NO_STORE"
         -e "GLM53_KV_CAPACITY_LOG=$GLM53_KV_CAPACITY_LOG"
+        -e "GLM53_KV_OFFLOAD=$GLM53_KV_OFFLOAD"
+        -e "GLM53_KV_OFFLOAD_DIR=$GLM53_KV_OFFLOAD_DIR_CTR"
+        -e "GLM53_KV_OFFLOAD_CPU_GB=$GLM53_KV_OFFLOAD_CPU_GB"
+        -e "GLM53_KV_OFFLOAD_RESTORE=$GLM53_KV_OFFLOAD_RESTORE"
+        -e "GLM53_KV_OFFLOAD_DRAFTER=$GLM53_KV_OFFLOAD_DRAFTER"
+        -e "GLM53_KV_OFFLOAD_KEEP_BOUNDARIES=$GLM53_KV_OFFLOAD_KEEP_BOUNDARIES"
+        -e "GLM53_KV_OFFLOAD_BUILD_ID=$GLM53_KV_OFFLOAD_BUILD_ID"
         -e "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
         -e "TILELANG_CACHE_DIR=$TILELANG_CACHE_DIR"
         -e "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=$VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"
@@ -1470,11 +1662,15 @@ launch_cluster() {
         -v '/tmp/patch_apc_per_group_retention.py:/opt/glm53/patch_apc_per_group_retention.py:ro' \
         -v '/tmp/patch_apc_no_store.py:/opt/glm53/patch_apc_no_store.py:ro' \
         -v '/tmp/patch_kv_capacity_log.py:/opt/glm53/patch_kv_capacity_log.py:ro' \
+        -v '/tmp/patch_kv_offload_scope.py:/opt/glm53/patch_kv_offload_scope.py:ro' \
+        -v '/tmp/patch_kv_offload_store_local.py:/opt/glm53/patch_kv_offload_store_local.py:ro' \
+        -v '/tmp/patch_kv_offload_restore_g0.py:/opt/glm53/patch_kv_offload_restore_g0.py:ro' \
         -v '/tmp/patch_xgrammar_termination.py:/opt/glm53/patch_xgrammar_termination.py:ro' \
         -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
         -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
         -v '/tmp/glm53-ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro' \
         -v '/tmp/patch_ablit.py:/opt/glm53/patch_ablit.py:ro' \
+        ${worker_offload_mount} \
         ${worker_preload} \
         ${worker_nccl} \
         -e NCCL_SOCKET_IFNAME='$WORKER_CX7_IF' \
@@ -1506,11 +1702,15 @@ launch_cluster() {
         -v "$PERGROUP_PATCH_HOST:/opt/glm53/patch_apc_per_group_retention.py:ro" \
         -v "$NOSTORE_PATCH_HOST:/opt/glm53/patch_apc_no_store.py:ro" \
         -v "$KVCAP_PATCH_HOST:/opt/glm53/patch_kv_capacity_log.py:ro" \
+        -v "$KVOFFLOAD_SCOPE_PATCH_HOST:/opt/glm53/patch_kv_offload_scope.py:ro" \
+        -v "$KVOFFLOAD_STORE_PATCH_HOST:/opt/glm53/patch_kv_offload_store_local.py:ro" \
+        -v "$KVOFFLOAD_RESTORE_PATCH_HOST:/opt/glm53/patch_kv_offload_restore_g0.py:ro" \
         -v "$XGRAMMAR_PATCH_HOST:/opt/glm53/patch_xgrammar_termination.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
         -v "$SCRIPT_DIR/overlay/ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro" \
         -v "$SCRIPT_DIR/overlay/patch_ablit.py:/opt/glm53/patch_ablit.py:ro" \
+        ${head_offload_mount[@]+"${head_offload_mount[@]}"} \
         "${head_preload[@]}" \
         "${nccl_common[@]}" \
         -e NCCL_SOCKET_IFNAME="$HEAD_CX7_IF" \
@@ -1746,7 +1946,7 @@ logs() {
 main() {
     local cmd="${1:-start}"
     case "$cmd" in
-        start|restart) validate_numeric_config; validate_overlay_artifacts ;;
+        start|restart) validate_numeric_config; validate_overlay_artifacts; validate_kv_offload_artifacts ;;
     esac
     case "$cmd" in
         stop)     banner stop.sh ;;

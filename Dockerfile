@@ -456,6 +456,11 @@ COPY tests/test_apc_per_group_retention.py /opt/glm53/test_apc_per_group_retenti
 COPY tests/test_hybrid_prefix_hit.py /opt/glm53/test_hybrid_prefix_hit.py
 COPY overlay/patch_apc_no_store.py /opt/glm53/patch_apc_no_store.py
 COPY tests/test_apc_no_store.py /opt/glm53/test_apc_no_store.py
+COPY overlay/patch_kv_offload_scope.py /opt/glm53/patch_kv_offload_scope.py
+COPY overlay/patch_kv_offload_store_local.py /opt/glm53/patch_kv_offload_store_local.py
+COPY overlay/kv_offload_store_gc.py /opt/glm53/kv_offload_store_gc.py
+COPY tests/test_kv_offload_scope.py /opt/glm53/test_kv_offload_scope.py
+COPY tests/test_kv_offload_store_local.py /opt/glm53/test_kv_offload_store_local.py
 COPY overlay/patch_xgrammar_termination.py /opt/glm53/patch_xgrammar_termination.py
 COPY tests/test_xgrammar_termination.py /opt/glm53/test_xgrammar_termination.py
 COPY overlay/patch_kv_capacity_log.py /opt/glm53/patch_kv_capacity_log.py
@@ -490,6 +495,14 @@ RUN python3 /opt/glm53/patch_apc_no_store.py
 # the deployment's synthetic hybrid layout (642 usable ids / 38 ids per segment).
 RUN GLM53_KV_CACHE_UTILS_PY=/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py GLM53_REQUIRE_TARGET=1 python3 /opt/glm53/test_kv_capacity_log.py
 RUN python3 /opt/glm53/patch_kv_capacity_log.py
+# Order-dependent pair: scope rewrites the offloading connector group
+# pairing; store_local anchors on scope's scheduler output. Host tests run
+# against the REAL in-image tree first (preflight + patched-runtime drive),
+# then the patchers bake the overlays in.
+RUN GLM53_REQUIRE_TARGET=1 python3 /opt/glm53/test_kv_offload_scope.py
+RUN python3 /opt/glm53/patch_kv_offload_scope.py
+RUN python3 /opt/glm53/patch_kv_offload_store_local.py
+RUN python3 /opt/glm53/test_kv_offload_store_local.py
 RUN python3 /opt/glm53/patch_xgrammar_termination.py
 RUN python3 /opt/glm53/patch_kpool_tail_slotmap.py
 RUN python3 /opt/glm53/patch_ablit.py
